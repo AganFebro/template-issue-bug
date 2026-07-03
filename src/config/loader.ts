@@ -4,7 +4,13 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity } from "./types.js";
+import type {
+  ClientIdentityConfig,
+  PoolConfig,
+  ProxyConfig,
+  ProviderEndpoints,
+  ProxyIdentity,
+} from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -28,7 +34,7 @@ const DEFAULTS = {
   ZAI_OPENAI_BASE: "https://api.z.ai/api/coding/paas/v4",
   BIGMODEL_ANTHROPIC_BASE: "https://open.bigmodel.cn/api/anthropic",
   BIGMODEL_OPENAI_BASE: "https://open.bigmodel.cn/api/coding/paas/v4",
-  APP_VERSION: "3.2.2",
+  APP_VERSION: "3.2.4",
   SOURCE_TITLE: "cli",
   REFERER_ORIGIN: "https://zcode.z.ai",
   CLIENT_IDENTITY_MODE: "observe" as const,
@@ -53,32 +59,45 @@ export function loadConfig(path: string): ProxyConfig {
 
   // --- server ---
   const port = resolvePort(process.env[ENV.PORT] ?? parsed?.server?.port);
-  const host = typeof parsed?.server?.host === "string" ? parsed.server.host : DEFAULTS.HOST;
+  const host =
+    typeof parsed?.server?.host === "string"
+      ? parsed.server.host
+      : DEFAULTS.HOST;
 
   // --- auth ---
-  const proxyApiKey = process.env[ENV.PROXY_API_KEY] ?? parsed?.auth?.proxyApiKey;
-  const mode = parsed?.auth?.mode === "oauth" ? "oauth" : "apikey";
+  const proxyApiKey =
+    process.env[ENV.PROXY_API_KEY] ?? parsed?.auth?.proxyApiKey;
+  const mode = resolveAuthMode(parsed?.auth?.mode);
   const apiKey = process.env[ENV.API_KEY] ?? parsed?.auth?.apiKey;
   const oauthCredentialsPath = parsed?.auth?.oauthCredentialsPath;
 
   // --- provider ---
-  const provider = resolveProvider(process.env[ENV.PROVIDER] ?? parsed?.provider);
+  const provider = resolveProvider(
+    process.env[ENV.PROVIDER] ?? parsed?.provider,
+  );
   const plan = resolvePlan(parsed?.plan);
 
   // --- providers ---
   const zai: ProviderEndpoints = {
-    anthropicBase: parsed?.providers?.zai?.anthropicBase ?? DEFAULTS.ZAI_ANTHROPIC_BASE,
+    anthropicBase:
+      parsed?.providers?.zai?.anthropicBase ?? DEFAULTS.ZAI_ANTHROPIC_BASE,
     openaiBase: parsed?.providers?.zai?.openaiBase ?? DEFAULTS.ZAI_OPENAI_BASE,
     credential: parsed?.providers?.zai?.credential,
   };
   const bigmodel: ProviderEndpoints = {
-    anthropicBase: parsed?.providers?.bigmodel?.anthropicBase ?? DEFAULTS.BIGMODEL_ANTHROPIC_BASE,
-    openaiBase: parsed?.providers?.bigmodel?.openaiBase ?? DEFAULTS.BIGMODEL_OPENAI_BASE,
+    anthropicBase:
+      parsed?.providers?.bigmodel?.anthropicBase ??
+      DEFAULTS.BIGMODEL_ANTHROPIC_BASE,
+    openaiBase:
+      parsed?.providers?.bigmodel?.openaiBase ?? DEFAULTS.BIGMODEL_OPENAI_BASE,
     credential: parsed?.providers?.bigmodel?.credential,
   };
 
   // --- models ---
-  const defaultModel = typeof parsed?.defaultModel === "string" ? parsed.defaultModel : DEFAULTS.DEFAULT_MODEL;
+  const defaultModel =
+    typeof parsed?.defaultModel === "string"
+      ? parsed.defaultModel
+      : DEFAULTS.DEFAULT_MODEL;
   const models = Array.isArray(parsed?.models) ? parsed.models : [defaultModel];
 
   // --- logging ---
@@ -96,6 +115,9 @@ export function loadConfig(path: string): ProxyConfig {
 
   const clientIdentity = resolveClientIdentity(parsed?.clientIdentity);
 
+  // --- pool ---
+  const pool = mode === "pool" ? resolvePoolConfig(parsed?.pool) : undefined;
+
   const config: ProxyConfig = {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -107,6 +129,7 @@ export function loadConfig(path: string): ProxyConfig {
     identity,
     clientIdentity,
     logging: { level: logLevel },
+    ...(pool ? { pool } : {}),
   };
 
   validate(config);
@@ -114,20 +137,48 @@ export function loadConfig(path: string): ProxyConfig {
 }
 
 function resolveClientIdentity(raw: unknown): ClientIdentityConfig {
-  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const obj =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
   const mode = resolveClientIdentityMode(obj.mode);
-  const ttlSeconds = resolvePositiveInt(obj.ttlSeconds, DEFAULTS.CLIENT_IDENTITY_TTL_SECONDS, "clientIdentity.ttlSeconds");
-  const maxSessions = resolvePositiveInt(obj.maxSessions, DEFAULTS.CLIENT_IDENTITY_MAX_SESSIONS, "clientIdentity.maxSessions");
+  const ttlSeconds = resolvePositiveInt(
+    obj.ttlSeconds,
+    DEFAULTS.CLIENT_IDENTITY_TTL_SECONDS,
+    "clientIdentity.ttlSeconds",
+  );
+  const maxSessions = resolvePositiveInt(
+    obj.maxSessions,
+    DEFAULTS.CLIENT_IDENTITY_MAX_SESSIONS,
+    "clientIdentity.maxSessions",
+  );
   return { mode, ttlSeconds, maxSessions };
 }
 
 function resolveClientIdentityMode(raw: unknown): ClientIdentityConfig["mode"] {
   if (raw === undefined || raw === null) return DEFAULTS.CLIENT_IDENTITY_MODE;
   if (raw === "off" || raw === "observe" || raw === "enforce") return raw;
-  throw new Error(`Invalid clientIdentity.mode "${String(raw)}": must be "off", "observe", or "enforce"`);
+  throw new Error(
+    `Invalid clientIdentity.mode "${String(raw)}": must be "off", "observe", or "enforce"`,
+  );
 }
 
-function resolvePositiveInt(raw: unknown, fallback: number, name: string): number {
+function resolvePoolConfig(raw: unknown): PoolConfig {
+  const obj =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  return {
+    poolPath: typeof obj.poolPath === "string" ? obj.poolPath : "pool.json",
+    refreshIntervalMs: resolvePositiveInt(
+      obj.refreshIntervalMs,
+      300000,
+      "pool.refreshIntervalMs",
+    ),
+  };
+}
+
+function resolvePositiveInt(
+  raw: unknown,
+  fallback: number,
+  name: string,
+): number {
   if (raw === undefined || raw === null) return fallback;
   const n = typeof raw === "number" ? raw : parseInt(String(raw), 10);
   if (!Number.isInteger(n) || n < 1) {
@@ -160,6 +211,12 @@ function resolvePlan(raw: unknown): "coding-plan" | "start-plan" {
   return DEFAULTS.PLAN;
 }
 
+function resolveAuthMode(raw: unknown): "apikey" | "oauth" | "pool" {
+  if (raw === "oauth") return "oauth";
+  if (raw === "pool") return "pool";
+  return "apikey";
+}
+
 /** Resolve log level with fallback. */
 function resolveLogLevel(raw: unknown): "debug" | "info" | "warn" | "error" {
   const levels = ["debug", "info", "warn", "error"] as const;
@@ -180,14 +237,25 @@ interface IdentityInputs {
 
 /** Resolve identity fields (env > YAML > default). Non-ASCII `appVersion` silently falls back to the default. */
 function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
-  const rawVersion = (inp.appVersionEnv ?? inp.appVersionYaml ?? DEFAULTS.APP_VERSION).trim();
-  const appVersion = ASCII_PRINTABLE.test(rawVersion) ? rawVersion : DEFAULTS.APP_VERSION;
+  const rawVersion = (
+    inp.appVersionEnv ??
+    inp.appVersionYaml ??
+    DEFAULTS.APP_VERSION
+  ).trim();
+  const appVersion = ASCII_PRINTABLE.test(rawVersion)
+    ? rawVersion
+    : DEFAULTS.APP_VERSION;
 
-  const sourceTitle = (inp.sourceTitleEnv ?? inp.sourceTitleYaml ?? DEFAULTS.SOURCE_TITLE).trim()
-    || DEFAULTS.SOURCE_TITLE;
+  const sourceTitle =
+    (
+      inp.sourceTitleEnv ??
+      inp.sourceTitleYaml ??
+      DEFAULTS.SOURCE_TITLE
+    ).trim() || DEFAULTS.SOURCE_TITLE;
 
-  const refererOrigin = (inp.refererEnv ?? inp.refererYaml ?? DEFAULTS.REFERER_ORIGIN).trim()
-    || DEFAULTS.REFERER_ORIGIN;
+  const refererOrigin =
+    (inp.refererEnv ?? inp.refererYaml ?? DEFAULTS.REFERER_ORIGIN).trim() ||
+    DEFAULTS.REFERER_ORIGIN;
 
   return { appVersion, sourceTitle, refererOrigin };
 }
@@ -195,12 +263,16 @@ function resolveIdentity(inp: IdentityInputs): ProxyIdentity {
 /** Cross-field validation after all fields are resolved. */
 function validate(config: ProxyConfig): void {
   if (config.server.port < 1 || config.server.port > 65535) {
-    throw new Error(`server.port ${config.server.port} is out of range (1-65535)`);
+    throw new Error(
+      `server.port ${config.server.port} is out of range (1-65535)`,
+    );
   }
 
   if (config.auth.mode === "apikey") {
-    const hasGlobal = typeof config.auth.apiKey === "string" && config.auth.apiKey.length > 0;
-    const hasProvider = typeof config.providers[config.provider].credential === "string";
+    const hasGlobal =
+      typeof config.auth.apiKey === "string" && config.auth.apiKey.length > 0;
+    const hasProvider =
+      typeof config.providers[config.provider].credential === "string";
     if (!hasGlobal && !hasProvider) {
       throw new Error(
         `auth.apiKey is required when auth.mode is "apikey" (or set providers.${config.provider}.credential)`,

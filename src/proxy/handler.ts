@@ -102,7 +102,7 @@ export async function proxyRequest(
 
   let cred;
   try {
-    cred = await auth.getCredential();
+    cred = await auth.getCredential(meta.model);
   } catch (err) {
     if (debug)
       debugError(reqId, "credential_unavailable", (err as Error).message);
@@ -230,7 +230,7 @@ export async function proxyRequest(
     printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
     return errorResponse(502, "upstream_unreachable", (err as Error).message);
   }
-  const headersAt = Date.now();
+  let headersAt = Date.now();
 
   if (debug) {
     debugLine(reqId, `← ${upstreamResp.status} ${upstreamResp.statusText}`);
@@ -375,6 +375,87 @@ export async function proxyRequest(
         statusText: upstreamResp.statusText,
         headers: upstreamResp.headers,
       });
+    }
+  }
+
+  // Pool mode: on gateway 1005 (quota exhausted), rotate to next account
+  if (startPlan && auth.isPool() && upstreamResp.status === 200) {
+    const ct2 = upstreamResp.headers.get("content-type") ?? "";
+    if (ct2.includes("application/json")) {
+      const bodyText = await upstreamResp.text().catch(() => null);
+      if (bodyText) {
+        try {
+          const parsed = JSON.parse(bodyText) as { code?: number };
+          if (parsed.code === 1005) {
+            console.log(
+              `${reqId} pool: quota exhausted for ${meta.model}, rotating...`,
+            );
+            auth.markExhausted(cred, meta.model);
+            const nextCred = await auth
+              .getCredential(meta.model)
+              .catch(() => null);
+            if (nextCred) {
+              cred = nextCred;
+              upstreamHeaderPairs = buildUpstreamHeaderPairs(
+                clientReq,
+                upstreamFormat,
+                cred,
+                config.identity,
+                config.plan,
+                captchaHeaders,
+                clientSession,
+              );
+              upstreamReq = buildUpstreamRequest(
+                clientReq,
+                upstreamFormat,
+                provider,
+                cred,
+                transformedBody,
+                config.identity,
+                config.plan,
+                captchaHeaders,
+                clientSession,
+              );
+              upstreamResp = await sendUpstreamRequest(
+                upstreamReq,
+                upstreamHeaderPairs,
+                transformedBody,
+                translateOpenAIToAnthropic ||
+                  translateAnthropicToOpenAI ||
+                  startPlan,
+                useOrderedTransport,
+                fetchImpl,
+              ).catch((err: Error) => {
+                if (debug)
+                  debugError(reqId, "upstream_unreachable", err.message);
+                printRow(
+                  reqId,
+                  format,
+                  meta,
+                  502,
+                  started,
+                  Date.now(),
+                  0,
+                  0,
+                  0,
+                );
+                return errorResponse(502, "upstream_unreachable", err.message);
+              });
+              if (debug)
+                debugLine(reqId, `← pool retry ${upstreamResp.status}`);
+              headersAt = Date.now();
+            }
+          }
+        } catch {
+          /* ignore — pass through */
+        }
+        // Reconstruct so downstream code can still read the body
+        upstreamResp = new Response(bodyText, {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: upstreamResp.headers,
+        });
+      }
     }
   }
 

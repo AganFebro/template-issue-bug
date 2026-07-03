@@ -73,9 +73,17 @@ auth:
     expect(cfg.provider).toBe("zai");
     expect(cfg.defaultModel).toBe("glm-4.6");
     expect(cfg.logging.level).toBe("info");
-    expect(cfg.providers.zai.anthropicBase).toBe("https://api.z.ai/api/anthropic");
-    expect(cfg.providers.bigmodel.openaiBase).toBe("https://open.bigmodel.cn/api/coding/paas/v4");
-    expect(cfg.clientIdentity).toEqual({ mode: "observe", ttlSeconds: 900, maxSessions: 1024 });
+    expect(cfg.providers.zai.anthropicBase).toBe(
+      "https://api.z.ai/api/anthropic",
+    );
+    expect(cfg.providers.bigmodel.openaiBase).toBe(
+      "https://open.bigmodel.cn/api/coding/paas/v4",
+    );
+    expect(cfg.clientIdentity).toEqual({
+      mode: "observe",
+      ttlSeconds: 900,
+      maxSessions: 1024,
+    });
   });
 
   it("clientIdentity: YAML values override defaults", () => {
@@ -89,7 +97,11 @@ clientIdentity:
   maxSessions: 8
 `);
     const cfg = loadConfig(path);
-    expect(cfg.clientIdentity).toEqual({ mode: "enforce", ttlSeconds: 60, maxSessions: 8 });
+    expect(cfg.clientIdentity).toEqual({
+      mode: "enforce",
+      ttlSeconds: 60,
+      maxSessions: 8,
+    });
   });
 
   it("throws on invalid clientIdentity.mode", () => {
@@ -164,7 +176,9 @@ auth:
   });
 
   it("throws when config file not found", () => {
-    expect(() => loadConfig("/nonexistent/path/config.yaml")).toThrow(/not found/);
+    expect(() => loadConfig("/nonexistent/path/config.yaml")).toThrow(
+      /not found/,
+    );
   });
 
   it("auto-adds defaultModel to models list if missing", () => {
@@ -188,7 +202,7 @@ auth:
   apiKey: "abc"
 `);
     const cfg = loadConfig(path);
-    expect(cfg.identity.appVersion).toBe("3.2.2");
+    expect(cfg.identity.appVersion).toBe("3.2.4");
     expect(cfg.identity.sourceTitle).toBe("cli");
     expect(cfg.identity.refererOrigin).toBe("https://zcode.z.ai");
   });
@@ -231,6 +245,6 @@ identity:
   appVersion: "v3.2.2-中文"
 `);
     const cfg = loadConfig(path);
-    expect(cfg.identity.appVersion).toBe("3.2.2");
+    expect(cfg.identity.appVersion).toBe("3.2.4");
   });
 });

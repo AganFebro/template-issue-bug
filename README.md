@@ -2,6 +2,8 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+> **Acknowledgments:** This project builds upon [TriDefender/zcode-api](https://github.com/TriDefender/zcode-api) (proxy architecture and reverse-engineering) and [Ryzzkiaa/autoclaw-register](https://github.com/Ryzzkiaa/autoclaw-register) (Playwright OAuth registration) - thank you!
+
 ## Quick Start
 
 ```bash
@@ -63,6 +65,58 @@ If you already use the ZCode desktop app, import the API key directly:
 ```bash
 bun run src/index.ts auth login bigmodel --import
 ```
+
+### Option 4: Account Pool (multi-account quota rotation)
+
+For start-plan, you can register multiple accounts and rotate between them automatically as quotas are exhausted. Uses `pool.json` for credential storage and `billing/balance` for real-time quota tracking.
+
+**Setup:**
+
+```bash
+# Register accounts (auto-saves to pool.json)
+cd zcode-register
+pip install -r requirements.txt
+python zcode_register.py
+
+# Check aggregate pool balance
+python check_balance.py
+python check_balance.py --detail   # per-account
+python check_balance.py --failed   # show stale JWTs
+```
+
+Then in `config.yaml`:
+
+```yaml
+auth:
+  mode: pool
+provider: zai
+plan: start-plan
+
+pool:
+  poolPath: "pool.json"
+  refreshIntervalMs: 300000  # 5 min
+```
+
+The pool manager picks the account with the most remaining quota for per model. On 1005 "exceed quota limit", the account is marked exhausted silently and the request retries with the next best account. Quotas are refreshed every 5 minutes via `billing/balance`.
+
+## Auto-Register Tools (`zcode-register/`)
+
+| Script | Description |
+|--------|-------------|
+| `zcode_register.py` | Playwright Google OAuth → chat.z.ai → auto-activate start-plan → append to `../pool.json` |
+| `check_balance.py` | Aggregate quota across all pool accounts, parallel fetch, retry on failure |
+
+### Register Configuration (`config.json`)
+
+```json
+{
+  "password": "your_gmail_password",
+  "batch_size": 2
+}
+```
+
+- `email.txt` — one Gmail address per line; successfully registered emails are auto-removed
+- `batch_size` — how many accounts to register in parallel (2-3 recommended)
 
 ## Start-Plan (zcode.z.ai Gateway)
 
@@ -168,11 +222,14 @@ curl http://localhost:8080/v1/models \
 |-------|---------|---------|-------------|
 | `server.port` | `ZCODE_PROXY_PORT` | `8080` | Listen port |
 | `auth.apiKey` | `ZCODE_API_KEY` | — | Upstream API key |
+| `auth.mode` | — | `apikey` | `apikey`, `oauth`, or `pool` |
 | `auth.proxyApiKey` | `ZCODE_PROXY_API_KEY` | — | Client auth key |
 | `provider` | `ZCODE_PROVIDER` | `zai` | Upstream provider |
 | `plan` | — | `coding-plan` | Plan tier: `coding-plan` (direct upstream) or `start-plan` (zcode.z.ai gateway + JWT + captcha) |
 | `providers.<p>.credential` | — | — | Per-provider credential override (else uses `auth.apiKey`) |
-| `identity.appVersion` | `ZCODE_APP_VERSION` | `3.2.2` | `User-Agent: ZCode/{version}` |
+| `pool.poolPath` | — | `pool.json` | Path to pool credentials JSON (pool mode only) |
+| `pool.refreshIntervalMs` | — | `300000` | Quota refresh interval in ms (pool mode only) |
+| `identity.appVersion` | `ZCODE_APP_VERSION` | `3.2.4` | `User-Agent: ZCode/{version}` |
 | `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `cli` | `X-Title: Z Code@{title}` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
 | config file path | `ZCODE_PROXY_CONFIG` | `config.yaml` | Config file to load on `serve` |
@@ -237,6 +294,10 @@ Response Handling
   Translation SSE stream:   Anthropic SSE ↔ OpenAI SSE chunks → client
   Gateway error detection:  peekUpstreamJsonError converts 1005/3001/3012 JSON errors
                             (returned with 200 status) to proper HTTP 402/400/405
+  Pool rotation (start-plan): on 1005 quota exhaustion, mark account exhausted →
+                            rotate to next best account → silently retry
+  Pool quota refresh:      background timer calls billing/balance per account every
+                            `refreshIntervalMs` to keep quota data current
 ```
 
 ## Development

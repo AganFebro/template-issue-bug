@@ -21,11 +21,19 @@ interface AuthConfig {
    */
   proxyApiKey?: string;
   /** How the proxy obtains the upstream credential. */
-  mode: "apikey" | "oauth";
+  mode: "apikey" | "oauth" | "pool";
   /** Direct credential for `apikey` mode. Format: `{apiKey}` or `{apiKey}.{secret}` (Z.AI). */
   apiKey?: string;
   /** Path to stored OAuth credentials (for `oauth` mode). */
   oauthCredentialsPath?: string;
+}
+
+/** Pool-mode configuration for multi-account quota rotation. */
+export interface PoolConfig {
+  /** Path to pool.json relative to CWD. Default: "pool.json". */
+  poolPath: string;
+  /** How often to refresh quotas from the billing API (ms). Default: 300000 (5 min). */
+  refreshIntervalMs: number;
 }
 
 /**
@@ -84,4 +92,6 @@ export interface ProxyConfig {
   logging: {
     level: "debug" | "info" | "warn" | "error";
   };
+  /** Account pool config (only used when auth.mode is "pool"). */
+  pool?: PoolConfig;
 }

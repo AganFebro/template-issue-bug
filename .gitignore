@@ -14,5 +14,8 @@ __pycache__/
 *.py[cod]
 capcha-diagnostic*.ts
 test-leak.ts
+fix-pool.ts
 fix-fn.ts
 debug*.png
+pool.json
+test_encrypted.json
