@@ -2,8 +2,6 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
-> **Acknowledgments:** This project builds upon [TriDefender/zcode-api](https://github.com/TriDefender/zcode-api) (proxy architecture and reverse-engineering) and [Ryzzkiaa/autoclaw-register](https://github.com/Ryzzkiaa/autoclaw-register) (Playwright OAuth registration) - thank you!
-
 ## Quick Start
 
 ```bash
