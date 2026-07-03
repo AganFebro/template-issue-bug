@@ -1,0 +1,8 @@
+{
+  "password": "hehe",
+  "batch_size": 1,
+  "email_file": "email.txt",
+  "accounts_file": "autoclaw_accounts.json",
+  "tokens_file": "accesstoken.txt",
+  "proxies": []
+}
