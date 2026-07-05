@@ -142,6 +142,13 @@ async function serve(
   console.log(`  models: ${config.models.length} available`);
   if (auth.isPool()) {
     console.log(`  pool: ${auth.poolSize} accounts`);
+    if (config.pool?.accountProxies?.length) {
+      console.log(`  pool account proxies: ${config.pool.accountProxies.length} configured`);
+    } else {
+      console.log(
+        `  \x1b[33mpool account proxies: (none) — captcha/API requests use this machine's own IP\x1b[0m`,
+      );
+    }
   } else if (config.auth.mode !== "pool" && existsSync("pool.json")) {
     console.log(
       `  \x1b[33mpool: pool.json found — set auth.mode: "pool" to enable\x1b[0m`,
@@ -187,6 +194,9 @@ function printDebugBanner(config: ProxyConfig, path: string): void {
     `  client identity: mode=${config.clientIdentity.mode} ttl=${config.clientIdentity.ttlSeconds}s max=${config.clientIdentity.maxSessions}`,
   );
   console.log(`  outbound proxy: ${config.outboundProxy?.url ?? "(none)"}`);
+  console.log(
+    `  pool account proxies: ${config.pool?.accountProxies?.length ? `${config.pool.accountProxies.length} configured` : "(none)"}`,
+  );
   console.log(`  anthropic base: ${active.anthropicBase}`);
   console.log(`  openai base:    ${active.openaiBase}`);
   console.log(`  credential: ${credShape}`);
