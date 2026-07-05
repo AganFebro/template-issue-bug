@@ -181,7 +181,7 @@ export async function proxyRequest(
   let captchaHeaders: Record<string, string> | undefined;
   if (startPlan) {
     try {
-      const token = await getCaptchaToken(config.identity.appVersion, config.outboundProxy);
+      const token = await getCaptchaToken(config.identity.appVersion, effectiveOutboundProxy(config, cred));
       captchaHeaders = {
         [RETRY_HEADERS.PARAM]: token.verifyParam,
         [RETRY_HEADERS.REGION]: token.region,
@@ -289,7 +289,7 @@ export async function proxyRequest(
     console.log(`${reqId} captcha challenge, re-solving...`);
     invalidateCaptchaToken();
     try {
-      const fresh = await getCaptchaToken(config.identity.appVersion, config.outboundProxy);
+      const fresh = await getCaptchaToken(config.identity.appVersion, effectiveOutboundProxy(config, cred));
       console.log(
         `${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`,
       );
@@ -414,7 +414,7 @@ export async function proxyRequest(
       try {
         const fresh = await getCaptchaToken(
           config.identity.appVersion,
-          config.outboundProxy,
+          effectiveOutboundProxy(config, cred),
         );
         retryHeaders = {
           [RETRY_HEADERS.PARAM]: fresh.verifyParam,
@@ -660,6 +660,23 @@ function effectiveFetchImpl(
   return cred.proxyUrl
     ? createProxiedFetch({ url: cred.proxyUrl }, fetchImpl)
     : fetchImpl;
+}
+
+/**
+ * Resolve the outbound proxy to use for captcha solving: prefer the
+ * credential's sticky per-account proxy (pool mode with
+ * `pool.accountProxies`) so the captcha-solving browser's egress IP matches
+ * the same one the upstream LLM request will use, falling back to the
+ * global `outboundProxy`. Mismatched or datacenter/VPS IPs are a common
+ * cause of Aliyun's captcha risk engine rejecting an otherwise-valid solve
+ * with `verifyCode: F001` ("traceless verification failed") — the SDK ran
+ * fine and submitted a fingerprint, but the server-side risk score failed it.
+ */
+function effectiveOutboundProxy(
+  config: ProxyConfig,
+  cred: Credential,
+): ProxyConfig["outboundProxy"] {
+  return cred.proxyUrl ? { url: cred.proxyUrl } : config.outboundProxy;
 }
 
 /**
