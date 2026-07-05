@@ -2,6 +2,8 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
+## No proxy support yet! Not recommend if you run on datacenter IP (VPS)
+
 ## Quick Start
 
 ```bash
