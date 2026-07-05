@@ -95,9 +95,9 @@ class CallbackHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query) if parsed.query else {}
         code = (qs.get("authCode") or qs.get("code") or [""])[0]
         error = (qs.get("error") or [""])[0]
+        handler = self.__class__
 
         if code:
-            handler = self.__class__
             if handler.result is not None:
                 handler.result["code"] = code
                 handler.result["received"] = True
