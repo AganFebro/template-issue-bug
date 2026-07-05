@@ -28,12 +28,27 @@ see the `proxy` param and pool.accountProxies in the main config.
 
 import asyncio
 import json
+import os
 import socket
 import sys
+import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from cloakbrowser import launch_async
+
+_T0 = time.monotonic()
+
+
+def _log_ts(label: str) -> None:
+    """Timestamped stderr breadcrumb (elapsed seconds since process start).
+
+    Diagnostic-only: pinpoints whether a slow/stuck solve is spent in
+    CloakBrowser's launch (binary start, geoip DB download/lookup — CPU and
+    network bound, ~70 MB on first use) vs. the actual page/captcha steps.
+    Cheap and always-on since it only writes a few short lines to stderr.
+    """
+    print(f"[timing] +{time.monotonic() - _T0:.2f}s {label}", file=sys.stderr, flush=True)
 
 # geoip auto-detection (timezone/locale from the proxy's exit IP) needs the
 # optional `cloakbrowser[geoip]` extra (geoip2 package). Degrade gracefully
@@ -85,8 +100,17 @@ async def solve(
     upstream requests, so the captcha-solve IP and the API-request IP match.
     """
     sdk_source = Path(sdk_path).read_text(encoding="utf-8")
+    _log_ts("sdk read")
     if proxy:
         _check_proxy_reachable(proxy)
+        _log_ts("proxy reachable")
+
+    # Kill-switch for the geoip lookup (timezone/locale auto-match from the
+    # proxy's exit IP): it downloads a ~70 MB GeoLite2 DB on first use and
+    # does live network resolution through the proxy. On a constrained VPS
+    # this can eat a large chunk of wall-clock time before the browser is
+    # even up. Set ZCODE_CAPTCHA_GEOIP=0 to rule it out without a code change.
+    geoip_enabled = bool(proxy) and _HAS_GEOIP and os.environ.get("ZCODE_CAPTCHA_GEOIP", "1") != "0"
 
     browser = await launch_async(
         headless=True,
@@ -95,7 +119,7 @@ async def solve(
         # and the optional geoip2 dependency is installed — avoids a
         # UTC/en-US-on-a-residential-IP mismatch signal. No proxy, or no
         # geoip2 installed → no geoip call, CloakBrowser's own defaults apply.
-        geoip=bool(proxy) and _HAS_GEOIP,
+        geoip=geoip_enabled,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",
@@ -105,6 +129,7 @@ async def solve(
             "--disable-site-isolation-trials",
         ],
     )
+    _log_ts("browser launched")
     try:
         # No manual user-agent/locale/timezone override, no navigator.webdriver
         # deletion, no WebGL JS patching — CloakBrowser's C++-level patches
@@ -114,28 +139,36 @@ async def solve(
         # plain-Playwright approach detectable.
         context = await browser.new_context(viewport={"width": 1280, "height": 720})
         page = await context.new_page()
+        _log_ts("context+page ready")
 
         # Set up the page shell, then inject the SDK via add_script_tag
-        # (avoids </script> parsing issues that break inline injection)
-        # wait_until="domcontentloaded" — our shell has zero external
-        # resources, so there's nothing for the default "load" wait to gain;
-        # it only makes us vulnerable to unrelated stalls (e.g. proxy/network
-        # layer hiccups) blocking on a full "load" event we don't need.
-        await page.set_content(
-            """<!DOCTYPE html>
+        # (avoids </script> parsing issues that break inline injection).
+        #
+        # page.set_content() is NOT a real navigation — it just injects HTML
+        # into the current document via CDP. Confirmed by timing logs that
+        # this hangs for the full 30s timeout specifically when the browser
+        # was launched with a `proxy` configured (reproduced identically on
+        # Windows and the VPS, with the proxy independently confirmed
+        # reachable) — Chromium's proxy-aware navigation/readiness machinery
+        # apparently never settles for a non-navigation content injection.
+        # A `data:` URL goto() is a genuine navigation, which exercises the
+        # same code path that already works fine for real proxied requests.
+        html = """<!DOCTYPE html>
             <html><head></head><body>
               <div id="captcha-element"></div>
               <button id="captcha-button"></button>
-            </body></html>""",
-            wait_until="domcontentloaded",
-        )
+            </body></html>"""
+        await page.goto("data:text/html;charset=utf-8," + quote(html), wait_until="domcontentloaded")
+        _log_ts("goto done")
         await page.add_script_tag(content=sdk_source)
+        _log_ts("sdk script tag injected")
 
         # Wait for the SDK to expose initAliyunCaptcha
         await page.wait_for_function(
             "typeof window.initAliyunCaptcha === 'function'",
             timeout=SDK_LOAD_TIMEOUT_MS,
         )
+        _log_ts("sdk ready")
 
         # Set the AliyunCaptchaConfig (SDK reads this on init)
         await page.evaluate(
