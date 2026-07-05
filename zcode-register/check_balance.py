@@ -18,8 +18,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+import proxy_utils
+
 # ──────────────────────────────────────────────────────────────
 POOL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pool.json")
+CONFIG_FILE = "config.json"
 API = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.2.4"
 
 HEADERS_TEMPLATE = {
@@ -31,6 +34,20 @@ HEADERS_TEMPLATE = {
 }
 
 
+def _load_config() -> dict:
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+# Outbound HTTP/SOCKS proxy (--proxy <url> or config.json "proxies"), if any.
+SESSION = proxy_utils.create_session(_load_config())
+
+
 def fetch_balance(account: dict, retries: int = 1) -> dict | None:
     """Fetch billing/balance for one account. Returns {name: {remaining, total}}."""
     jwt = account.get("jwt", "")
@@ -38,7 +55,7 @@ def fetch_balance(account: dict, retries: int = 1) -> dict | None:
         return None
     for attempt in range(retries):
         try:
-            r = requests.get(
+            r = SESSION.get(
                 API,
                 headers={"Authorization": f"Bearer {jwt}", **HEADERS_TEMPLATE},
                 timeout=15,

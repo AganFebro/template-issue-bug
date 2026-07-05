@@ -18,6 +18,8 @@ interface AuthManagerOptions {
   apiKey?: string;
   /** Pool config (only used in pool mode). */
   pool?: PoolConfig;
+  /** Override fetch (e.g. routed through an outbound proxy) for pool quota refresh. */
+  fetchImpl?: typeof fetch;
 }
 
 /**
@@ -44,7 +46,7 @@ export class AuthManager {
       );
     }
     if (opts.mode === "pool" && opts.pool) {
-      this.pool = new PoolManager(opts.pool);
+      this.pool = new PoolManager(opts.pool, opts.fetchImpl ?? fetch);
     }
   }
 

@@ -8,6 +8,18 @@
  * On a 402/1005 upstream rejection, the current account's relevant model
  * quota is marked as exhausted immediately (set to 0 remaining) so the
  * next request picks a different account.
+ *
+ * Model names are matched via `canonicalizeModelName` (lowercase, strip all
+ * non-alphanumeric characters) so lookups are case/punctuation-insensitive
+ * between client-requested model ids (e.g. "glm-4.5-air") and the billing
+ * API's `show_name` values (e.g. "GLM-4.5-Air") — no hardcoded per-model map
+ * to maintain as new models are added.
+ *
+ * Concurrent requests for the same model can independently pick the same
+ * account before quota state catches up (quota only truly updates via
+ * `refreshQuota()` every `refreshIntervalMs`, or via `markExhausted()` after
+ * a 1005 already happened). `getBestCredential` mitigates this with a
+ * short-lived per-account "recent selections" penalty — see `SELECTION_WINDOW_MS`.
  */
 
 import type { Credential } from "./types.js";
@@ -26,12 +38,43 @@ interface PoolEntry {
 
 interface QuotaInfo {
   lastRefreshed: number;
-  balances: Record<string /* model name */, { remaining: number; total: number }>;
+  balances: Record<string /* canonicalized model name */, { remaining: number; total: number }>;
 }
 
 interface PoolAccount extends PoolEntry {
   quota: QuotaInfo;
+  /**
+   * Recent selection timestamps per canonicalized model key. Used only to
+   * bias weighted-random selection away from accounts multiple concurrent
+   * requests just picked — not a hard reservation system, entries just age
+   * out of `SELECTION_WINDOW_MS`.
+   */
+  recentSelections: Record<string, number[]>;
+  /**
+   * Sticky outbound proxy URL assigned to this account (round-robin over
+   * `PoolConfig.accountProxies` by account index), or undefined when no
+   * per-account proxies are configured.
+   */
+  proxyUrl?: string;
 }
+
+/**
+ * Canonicalize a model name for quota lookup: lowercase, strip everything but
+ * letters/digits. Makes matching insensitive to casing/hyphens/dots between
+ * client-requested model ids and the billing API's `show_name` values.
+ */
+function canonicalizeModelName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Selection-timestamp window (ms) used to penalize an account's score when
+ * scoring for the *same* model if it was recently picked by another request.
+ * Heuristic mitigation for concurrent-request clustering, not a hard limiter
+ * — very long-running requests can outlast this window (acceptable; real
+ * quota state still self-corrects via `refreshQuota` and `markExhausted`).
+ */
+const SELECTION_WINDOW_MS = 15_000;
 
 /**
  * Loads pool.json, periodically refreshes quotas, and picks the best account
@@ -42,11 +85,13 @@ export class PoolManager {
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private readonly poolPath: string;
   private readonly refreshIntervalMs: number;
+  private readonly accountProxies: string[] | undefined;
   private fetchImpl: typeof fetch;
 
   constructor(config: PoolConfig, fetchImpl: typeof fetch = fetch) {
     this.poolPath = config.poolPath;
     this.refreshIntervalMs = config.refreshIntervalMs;
+    this.accountProxies = config.accountProxies;
     this.fetchImpl = fetchImpl;
   }
 
@@ -60,9 +105,13 @@ export class PoolManager {
     if (!Array.isArray(entries) || entries.length === 0) {
       throw new Error("pool.json is empty — register accounts first");
     }
-    this.accounts = entries.map((e) => ({
+    this.accounts = entries.map((e, idx) => ({
       ...e,
       quota: { lastRefreshed: 0, balances: {} },
+      recentSelections: {},
+      proxyUrl: this.accountProxies?.length
+        ? this.accountProxies[idx % this.accountProxies.length]
+        : undefined,
     }));
     // Initial refresh — don't block startup, run in background
     this.refreshAllQuotas().catch((err) =>
@@ -95,19 +144,23 @@ export class PoolManager {
   getBestCredential(model: string): Credential | null {
     if (this.accounts.length === 0) return null;
 
+    const modelKey = canonicalizeModelName(model);
+
     // Refresh if we have no quota data yet
     const allStale = this.accounts.every((a) => a.quota.lastRefreshed === 0);
-    if (allStale) return this.toCredential(this.accounts[0]);
+    if (allStale) return this.select(0, modelKey);
 
-    // Normalize model name for quota lookup
-    const modelKey = this.normalizeModelName(model);
+    const now = Date.now();
 
-    // Score accounts by remaining quota for this model
+    // Score accounts by remaining quota for this model, penalized by how many
+    // requests recently picked this same account+model — mitigates concurrent
+    // requests clustering on the same account before quota state catches up.
     const scored = this.accounts.map((a, idx) => {
       const bal = a.quota.balances[modelKey];
       if (!bal || bal.remaining <= 0) return { idx, score: 0 };
-      // Weight: remaining / total gives a 0-1 score
-      return { idx, score: bal.remaining / (bal.total || 1) };
+      const recentCount = this.pruneAndCountRecentSelections(a, modelKey, now);
+      const baseScore = bal.remaining / (bal.total || 1);
+      return { idx, score: baseScore / (1 + recentCount) };
     });
 
     // Sort descending by score
@@ -117,7 +170,7 @@ export class PoolManager {
     const top = scored.filter((s) => s.score > 0);
     if (top.length === 0) {
       // All accounts have 0 quota — pick any (first fallback)
-      return this.toCredential(this.accounts[0]);
+      return this.select(0, modelKey);
     }
 
     // Weighted random pick among accounts with quota
@@ -125,9 +178,9 @@ export class PoolManager {
     let rand = Math.random() * totalWeight;
     for (const s of top) {
       rand -= s.score;
-      if (rand <= 0) return this.toCredential(this.accounts[s.idx]);
+      if (rand <= 0) return this.select(s.idx, modelKey);
     }
-    return this.toCredential(this.accounts[top[top.length - 1].idx]);
+    return this.select(top[top.length - 1].idx, modelKey);
   }
 
   /**
@@ -135,7 +188,7 @@ export class PoolManager {
    * Called when upstream returns 1005 or 402 for this account + model.
    */
   markExhausted(cred: Credential, model: string): void {
-    const modelKey = this.normalizeModelName(model);
+    const modelKey = canonicalizeModelName(model);
     for (const a of this.accounts) {
       if (a.jwt === cred.jwt || a.apiKey === cred.apiKey) {
         if (!a.quota.balances[modelKey]) {
@@ -148,28 +201,41 @@ export class PoolManager {
     }
   }
 
-  private toCredential(entry: PoolEntry): Credential {
+  private toCredential(entry: PoolAccount): Credential {
     return {
       apiKey: entry.apiKey,
       secret: entry.secret,
       provider: entry.provider as any,
       jwt: entry.jwt,
       userId: entry.userId,
+      proxyUrl: entry.proxyUrl,
     };
   }
 
-  private normalizeModelName(model: string): string {
-    const lower = model.toLowerCase().replace(/[_-]/g, "");
-    const map: Record<string, string> = {
-      "glm52": "GLM-5.2",
-      "glm5.2": "GLM-5.2",
-      "glm5turbo": "GLM-5-Turbo",
-      "glm5.turbo": "GLM-5-Turbo",
-      "glm5": "GLM-5",
-      "glm46": "GLM-4.6",
-      "glm4.6": "GLM-4.6",
-    };
-    return map[lower] ?? lower;
+  /** Record a selection timestamp for account+model and return its credential. */
+  private select(idx: number, modelKey: string): Credential {
+    const account = this.accounts[idx];
+    const list = account.recentSelections[modelKey];
+    if (list) list.push(Date.now());
+    else account.recentSelections[modelKey] = [Date.now()];
+    return this.toCredential(account);
+  }
+
+  /**
+   * Prune selection timestamps outside `SELECTION_WINDOW_MS` and return the
+   * remaining (recent) count for this account+model.
+   */
+  private pruneAndCountRecentSelections(
+    account: PoolAccount,
+    modelKey: string,
+    now: number,
+  ): number {
+    const list = account.recentSelections[modelKey];
+    if (!list || list.length === 0) return 0;
+    const cutoff = now - SELECTION_WINDOW_MS;
+    const kept = list.filter((t) => t > cutoff);
+    account.recentSelections[modelKey] = kept;
+    return kept.length;
   }
 
   private async refreshAllQuotas(): Promise<void> {
@@ -211,7 +277,7 @@ export class PoolManager {
     const balances: Record<string, { remaining: number; total: number }> = {};
     for (const b of data.data.balances) {
       if (b.show_name) {
-        balances[b.show_name] = {
+        balances[canonicalizeModelName(b.show_name)] = {
           remaining: b.remaining_units ?? 0,
           total: b.total_units ?? 1,
         };

@@ -81,6 +81,22 @@ clientIdentity:
 pool:
   poolPath: "pool.json"
   refreshIntervalMs: 300000
+  # Optional: sticky per-account outbound proxy assignment (round-robin by
+  # account index) — each pool account always egresses through the same
+  # proxy IP. Useful for testing whether a gateway rejection (e.g. 1005) is
+  # actually a per-IP rate limit rather than genuine per-account quota
+  # exhaustion. Omit to use the global outboundProxy (or no proxy) for all
+  # accounts.
+  # accountProxies:
+  #   - "http://user:pass@host1:port1"
+  #   - "http://user:pass@host2:port2"
+
+# Outbound HTTP/HTTPS/SOCKS5 proxy for all upstream requests (LLM calls,
+# OAuth, key resolution, pool quota refresh, captcha config/solving).
+# Optional; omit to connect directly. Env var ZCODE_OUTBOUND_PROXY overrides
+# this and also applies to `zcode-proxy auth login`.
+# outboundProxy:
+#   url: "socks5://user:pass@host:port"
 
 logging:
   level: info

@@ -97,6 +97,53 @@ pool:
 
 The pool manager picks the account with the most remaining quota for per model. On 1005 "exceed quota limit", the account is marked exhausted silently and the request retries with the next best account. Quotas are refreshed every 5 minutes via `billing/balance`.
 
+## Outbound Proxy
+
+Route all outbound requests the proxy makes upstream (LLM chat completions, OAuth,
+key resolution, pool quota refresh, captcha config/solving) through an
+HTTP/HTTPS/SOCKS5 proxy:
+
+```yaml
+outboundProxy:
+  url: "socks5://user:pass@host:port"
+```
+
+Or via environment variable (overrides YAML, works for `auth login` too since
+it runs before `config.yaml` is loaded):
+
+```bash
+export ZCODE_OUTBOUND_PROXY="socks5://127.0.0.1:1080"
+```
+
+When a proxy is configured, the client-session `enforce` mode's exact-header-
+ordering transport (raw sockets) is automatically disabled in favor of the
+regular fetch path, since raw sockets can't honor an HTTP/SOCKS proxy.
+
+### Sticky Per-Account Proxy (pool mode)
+
+When using the account pool (`auth.mode: pool`), you can assign each pool
+account its own dedicated outbound proxy so it always egresses from the same
+IP across requests and restarts:
+
+```yaml
+pool:
+  poolPath: "pool.json"
+  refreshIntervalMs: 300000
+  accountProxies:
+    - "http://user:pass@host1:port1"
+    - "http://user:pass@host2:port2"
+```
+
+Accounts are assigned proxies round-robin by their position in `pool.json`
+(`accountProxies[index % accountProxies.length]`), so with fewer proxies than
+accounts, several accounts share a proxy — but the same account always uses
+the same one. This is useful when a gateway rejection (e.g. `1005` "quota
+exhausted") turns out to actually be a per-IP rate limit rather than genuine
+per-account quota exhaustion: giving each account a distinct IP avoids
+tripping shared rate limits from a single local IP hammering the gateway with
+many accounts. Falls back to the global `outboundProxy` (or no proxy) for
+accounts/requests without a `proxyUrl` assigned.
+
 ## Auto-Register Tools (`zcode-register/`)
 
 | Script | Description |
@@ -116,7 +163,34 @@ The pool manager picks the account with the most remaining quota for per model. 
 - `email.txt` — one Gmail address per line; successfully registered emails are auto-removed
 - `batch_size` — how many accounts to register in parallel (2-3 recommended)
 
-## Start-Plan (zcode.z.ai Gateway)
+### Outbound Proxy (zcode-register)
+
+Both `zcode_register.py` and `check_balance.py` can route all outbound requests
+(Google OAuth, token exchange, API key resolution, billing checks) and the
+Playwright browser through an HTTP/HTTPS/SOCKS5 proxy:
+
+```json
+{
+  "proxies": ["socks5://user:pass@host:port"]
+}
+```
+
+Or override per-run without editing `config.json`:
+
+```bash
+python zcode_register.py --proxy socks5://127.0.0.1:1080
+python check_balance.py --proxy http://127.0.0.1:8080
+```
+
+Only the first `proxies` entry is used — this project does not yet rotate
+outbound proxies per account. SOCKS5 requires `PySocks` (already in
+`requirements.txt`).
+
+The main proxy server has its own separate `outboundProxy` setting (see
+[Outbound Proxy](#outbound-proxy) below) for routing upstream LLM requests
+through a proxy.
+
+
 
 The `start-plan` tier routes through zcode.z.ai with JWT auth + captcha verification. It requires OAuth login mode.
 

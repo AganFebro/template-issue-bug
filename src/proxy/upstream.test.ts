@@ -572,6 +572,29 @@ describe("proxyRequest", () => {
     ).toBe(false);
   });
 
+  it("disables ordered transport when an outbound proxy is configured (raw sockets can't honor it)", () => {
+    const startPlanConfig: ProxyConfig = { ...testConfig, plan: "start-plan" };
+    const proxiedConfig: ProxyConfig = {
+      ...startPlanConfig,
+      outboundProxy: { url: "socks5://127.0.0.1:1080" },
+    };
+    const enforceSession = {
+      source: "lineage" as const,
+      action: "enforce" as const,
+      confidence: 0.95,
+      upstreamSessionId: "11111111-1111-4111-8111-111111111111",
+    };
+
+    // Without a proxy, enforce mode uses the ordered transport.
+    expect(shouldUseOrderedTransport(startPlanConfig, enforceSession, false)).toBe(
+      true,
+    );
+    // With a proxy configured, it falls back to fetchImpl regardless of session mode.
+    expect(shouldUseOrderedTransport(proxiedConfig, enforceSession, false)).toBe(
+      false,
+    );
+  });
+
   it("forwards request to upstream with injected auth", async () => {
     const fetchMock = mock(async (req: Request): Promise<Response> => {
       expect(req.url).toBe(

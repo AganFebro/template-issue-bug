@@ -6,6 +6,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
 import type {
   ClientIdentityConfig,
+  OutboundProxyConfig,
   PoolConfig,
   ProxyConfig,
   ProviderEndpoints,
@@ -21,6 +22,7 @@ const ENV = {
   APP_VERSION: "ZCODE_APP_VERSION",
   SOURCE_TITLE: "ZCODE_SOURCE_TITLE",
   REFERER_ORIGIN: "ZCODE_REFERER_ORIGIN",
+  OUTBOUND_PROXY: "ZCODE_OUTBOUND_PROXY",
 } as const;
 
 const DEFAULTS = {
@@ -118,6 +120,11 @@ export function loadConfig(path: string): ProxyConfig {
   // --- pool ---
   const pool = mode === "pool" ? resolvePoolConfig(parsed?.pool) : undefined;
 
+  // --- outbound proxy ---
+  const outboundProxy = resolveOutboundProxy(
+    process.env[ENV.OUTBOUND_PROXY] ?? parsed?.outboundProxy?.url,
+  );
+
   const config: ProxyConfig = {
     server: { port, host },
     auth: { proxyApiKey, mode, apiKey, oauthCredentialsPath },
@@ -130,6 +137,7 @@ export function loadConfig(path: string): ProxyConfig {
     clientIdentity,
     logging: { level: logLevel },
     ...(pool ? { pool } : {}),
+    ...(outboundProxy ? { outboundProxy } : {}),
   };
 
   validate(config);
@@ -164,6 +172,9 @@ function resolveClientIdentityMode(raw: unknown): ClientIdentityConfig["mode"] {
 function resolvePoolConfig(raw: unknown): PoolConfig {
   const obj =
     raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const accountProxies = Array.isArray(obj.accountProxies)
+    ? obj.accountProxies.filter((p): p is string => typeof p === "string" && p.trim().length > 0)
+    : undefined;
   return {
     poolPath: typeof obj.poolPath === "string" ? obj.poolPath : "pool.json",
     refreshIntervalMs: resolvePositiveInt(
@@ -171,7 +182,21 @@ function resolvePoolConfig(raw: unknown): PoolConfig {
       300000,
       "pool.refreshIntervalMs",
     ),
+    ...(accountProxies && accountProxies.length > 0 ? { accountProxies } : {}),
   };
+}
+
+/** Resolve outbound proxy from raw value. Returns undefined when not configured. */
+function resolveOutboundProxy(raw: unknown): OutboundProxyConfig | undefined {
+  if (typeof raw !== "string" || raw.trim().length === 0) return undefined;
+  const url = raw.trim();
+  // Basic validation: must look like a URI (anchored group so both branches respect ^)
+  if (!/^(https?|socks5h|socks[45]?):\/\/.+/i.test(url)) {
+    throw new Error(
+      `outboundProxy.url must be http://, https://, or socks[4|5|5h]:// URL, got: ${url}`,
+    );
+  }
+  return { url };
 }
 
 function resolvePositiveInt(

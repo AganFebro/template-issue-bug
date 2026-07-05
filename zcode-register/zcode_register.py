@@ -32,6 +32,8 @@ from urllib.parse import parse_qs, urlparse
 import requests
 from playwright.async_api import async_playwright
 
+import proxy_utils
+
 # ──────────────────────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────────────────────
@@ -56,6 +58,8 @@ def load_config():
 
 config = load_config()
 PASSWORD = config.get("password", DEFAULT_PASSWORD)
+# Outbound HTTP/SOCKS proxy (--proxy <url> or config.json "proxies"), if any.
+SESSION = proxy_utils.create_session(config)
 
 # ──────────────────────────────────────────────────────────────
 # CONSTANTS (mirrors src/auth/oauth.ts and src/auth/resolver.ts)
@@ -142,7 +146,7 @@ def build_authorize_url(callback_port: int) -> str:
 # ──────────────────────────────────────────────────────────────
 def exchange_code(auth_code: str, redirect_uri: str, state: str) -> dict:
     """POST zcode.z.ai token exchange. Returns {accessToken, userId, jwt} or raises."""
-    resp = requests.post(
+    resp = SESSION.post(
         TOKEN_URL,
         json={
             "provider": "zai",
@@ -168,7 +172,7 @@ def exchange_code(auth_code: str, redirect_uri: str, state: str) -> dict:
 
 def resolve_zai_biz_token(access_token: str) -> str:
     """Exchange Z.AI access token for biz token."""
-    resp = requests.post(
+    resp = SESSION.post(
         ZAI_LOGIN,
         json={"token": access_token},
         headers={"content-type": "application/json"},
@@ -186,7 +190,7 @@ def resolve_zai_biz_token(access_token: str) -> str:
 
 def resolve_customer_info(host: str, authorization: str) -> tuple:
     """Get org + project. Returns (orgId, projectId)."""
-    resp = requests.get(
+    resp = SESSION.get(
         f"{host}/api/biz/customer/getCustomerInfo",
         headers={"Authorization": authorization, "Content-Type": "application/json"},
         timeout=30,
@@ -227,7 +231,7 @@ def find_or_create_api_key(
     """Find or create an API key. Returns apiKey."""
     list_url = f"{host}/api/biz/v1/organization/{org_id}/projects/{project_id}/api_keys"
     try:
-        resp = requests.get(
+        resp = SESSION.get(
             list_url,
             headers={
                 "Authorization": authorization,
@@ -242,7 +246,7 @@ def find_or_create_api_key(
                 return found["apiKey"]
     except:
         pass
-    resp = requests.post(
+    resp = SESSION.post(
         list_url,
         json={"name": API_KEY_NAME},
         headers={"Authorization": authorization, "Content-Type": "application/json"},
@@ -260,7 +264,7 @@ def get_secret_key(
     from urllib.parse import quote
 
     url = f"{host}/api/biz/v1/organization/{org_id}/projects/{project_id}/api_keys/copy/{quote(api_key, safe='')}"
-    resp = requests.get(
+    resp = SESSION.get(
         url,
         headers={"Authorization": authorization, "Content-Type": "application/json"},
         timeout=30,
@@ -403,7 +407,9 @@ async def register_zcode(email: str, password: str) -> dict | None:
     print(f"  State    : {state[:16]}...")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=not HEADFUL)
+        browser = await p.chromium.launch(
+            headless=not HEADFUL, proxy=proxy_utils.playwright_proxy(config)
+        )
         try:
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 800},
@@ -712,7 +718,7 @@ async def register_zcode(email: str, password: str) -> dict | None:
             print(f"  ├─ Activating start-plan...")
             plan_found = False
             try:
-                r = requests.get(
+                r = SESSION.get(
                     "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.2.4",
                     headers={
                         "Authorization": f"Bearer {api_cred['jwt']}",

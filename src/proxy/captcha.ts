@@ -23,6 +23,8 @@
 import ALIYUN_SDK_LOCAL from "./AliyunCaptcha.js.txt" with { type: "text" };
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { OutboundProxyConfig } from "../config/types.js";
+import { createProxiedFetch } from "./outbound-proxy.js";
 
 const CAPTCHA_HEADER = "x-aliyun-captcha-verify-param";
 const REGION_HEADER = "x-aliyun-captcha-verify-region";
@@ -43,6 +45,23 @@ const SDK_PATH = join(
   dirname(fileURLToPath(import.meta.url)),
   "AliyunCaptcha.js.txt",
 );
+
+/**
+ * Python binary for captcha solver subprocess.
+ * Ubunt/Debian install Python as `python3`, not `python`.
+ * Set ZCODE_CAPTCHA_PYTHON to override the auto-detection.
+ */
+const PYTHON_BIN =
+  process.env.ZCODE_CAPTCHA_PYTHON ??
+  (() => {
+    for (const c of ["python3", "python"]) {
+      try {
+        Bun.spawnSync([c, "--version"]);
+        return c;
+      } catch {}
+    }
+    return "python3"; // best-effort default
+  })();
 
 interface FetchedCaptchaConfig {
   enabled: boolean;
@@ -97,11 +116,13 @@ export function invalidateCaptchaToken(): void {
 
 async function fetchCaptchaConfig(
   appVersion: string,
+  outboundProxy: OutboundProxyConfig | undefined,
 ): Promise<FetchedCaptchaConfig | null> {
   if (cachedConfig.value && cachedConfig.expiresAt > Date.now())
     return cachedConfig.value;
   try {
-    const resp = await fetch(
+    const fetchImpl = createProxiedFetch(outboundProxy);
+    const resp = await fetchImpl(
       `${CONFIGS_API}?app_version=${encodeURIComponent(appVersion)}&platform=win32-x64`,
     );
     const json = (await resp.json()) as {
@@ -117,25 +138,27 @@ async function fetchCaptchaConfig(
 
 export async function getCaptchaToken(
   appVersion: string,
+  outboundProxy?: OutboundProxyConfig,
 ): Promise<{ verifyParam: string; region: string }> {
   // No token caching: Aliyun captcha tokens are single-use. Reusing a cached
   // token causes 3007 "captcha verify failed" on every subsequent request.
   // Each call solves fresh via Playwright (~10s). The handler's pre-solve +
   // 3007-retry covers the rare case where a fresh token is rejected.
-  const cfg = await fetchCaptchaConfig(appVersion);
+  const cfg = await fetchCaptchaConfig(appVersion, outboundProxy);
   if (!cfg || !cfg.enabled || !cfg.prefix || !cfg.sceneId)
     throw new Error("Captcha config unavailable");
-  const verifyParam = await solveWithPlaywrightRetry(cfg);
+  const verifyParam = await solveWithPlaywrightRetry(cfg, outboundProxy);
   return { verifyParam, region: cfg.region };
 }
 
 async function solveWithPlaywrightRetry(
   cfg: FetchedCaptchaConfig,
+  outboundProxy: OutboundProxyConfig | undefined,
 ): Promise<string> {
   let lastErr: Error | null = null;
   for (let attempt = 1; attempt <= SOLVE_RETRIES; attempt++) {
     try {
-      return await solveWithPlaywright(cfg);
+      return await solveWithPlaywright(cfg, outboundProxy);
     } catch (err) {
       lastErr = err as Error;
       console.error(
@@ -154,16 +177,20 @@ async function solveWithPlaywrightRetry(
  * The Python script reads JSON config from stdin and writes JSON result to
  * stdout. A single attempt — retries are handled by the caller.
  */
-async function solveWithPlaywright(cfg: FetchedCaptchaConfig): Promise<string> {
+async function solveWithPlaywright(
+  cfg: FetchedCaptchaConfig,
+  outboundProxy: OutboundProxyConfig | undefined,
+): Promise<string> {
   const input = JSON.stringify({
     sceneId: cfg.sceneId,
     prefix: cfg.prefix,
     region: cfg.region,
     sdkPath: SDK_PATH,
     timeout: SOLVE_TIMEOUT_MS,
+    proxy: outboundProxy?.url,
   });
 
-  const proc = Bun.spawn(["python", SOLVER_SCRIPT_PATH], {
+  const proc = Bun.spawn([PYTHON_BIN, SOLVER_SCRIPT_PATH], {
     stdin: new Blob([input]),
     stdout: "pipe",
     stderr: "pipe",

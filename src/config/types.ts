@@ -34,6 +34,14 @@ export interface PoolConfig {
   poolPath: string;
   /** How often to refresh quotas from the billing API (ms). Default: 300000 (5 min). */
   refreshIntervalMs: number;
+  /**
+   * Optional list of outbound proxy URLs for sticky per-account assignment.
+   * Each pool account is assigned one proxy (round-robin by account index,
+   * `accountProxies[index % accountProxies.length]`) so it always egresses
+   * from the same IP across requests and restarts. Omit to use the global
+   * `outboundProxy` (or no proxy) for all pool accounts.
+   */
+  accountProxies?: string[];
 }
 
 /**
@@ -94,4 +102,12 @@ export interface ProxyConfig {
   };
   /** Account pool config (only used when auth.mode is "pool"). */
   pool?: PoolConfig;
+  /** Outbound HTTP/SOCKS proxy for all upstream requests. */
+  outboundProxy?: OutboundProxyConfig;
+}
+
+/** Outbound proxy configuration. Supports http://, https://, socks5:// URLs. */
+export interface OutboundProxyConfig {
+  /** Proxy URL (e.g. "socks5://127.0.0.1:1080", "http://proxy:8080"). */
+  url: string;
 }

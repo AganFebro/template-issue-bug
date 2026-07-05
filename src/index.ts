@@ -14,6 +14,7 @@ import {
 } from "./auth/store.js";
 import { ZaiOAuthClient, BigmodelOAuthClient } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
+import { createProxiedFetch } from "./proxy/outbound-proxy.js";
 import type { Credential } from "./auth/types.js";
 import type { ProviderId } from "./provider/types.js";
 import type { ProxyConfig } from "./config/types.js";
@@ -105,12 +106,14 @@ async function serve(
     );
   }
   const config = loadConfig(path);
+  const fetchImpl = createProxiedFetch(config.outboundProxy);
 
   const auth = new AuthManager({
     mode: config.auth.mode,
     provider: config.provider,
     apiKey: config.auth.apiKey ?? config.providers[config.provider].credential,
     pool: config.pool,
+    fetchImpl,
   });
 
   if (config.auth.mode === "oauth") {
@@ -130,7 +133,7 @@ async function serve(
 
   if (debug) printDebugBanner(config, path);
 
-  const server = startServer({ config, auth, debug });
+  const server = startServer({ config, auth, debug, fetchImpl });
   const url = `http://${server.hostname}:${server.port}`;
   console.log(`zcode-proxy listening on ${url}`);
   console.log(`  provider: ${config.provider}`);
@@ -143,6 +146,9 @@ async function serve(
     console.log(
       `  \x1b[33mpool: pool.json found — set auth.mode: "pool" to enable\x1b[0m`,
     );
+  }
+  if (config.outboundProxy) {
+    console.log(`  outbound proxy: ${config.outboundProxy.url}`);
   }
   if (debug) console.log(`  debug: ON`);
 
@@ -180,6 +186,7 @@ function printDebugBanner(config: ProxyConfig, path: string): void {
   console.log(
     `  client identity: mode=${config.clientIdentity.mode} ttl=${config.clientIdentity.ttlSeconds}s max=${config.clientIdentity.maxSessions}`,
   );
+  console.log(`  outbound proxy: ${config.outboundProxy?.url ?? "(none)"}`);
   console.log(`  anthropic base: ${active.anthropicBase}`);
   console.log(`  openai base:    ${active.openaiBase}`);
   console.log(`  credential: ${credShape}`);
@@ -225,7 +232,8 @@ async function authLogin(args: string[]): Promise<void> {
   } else {
     const { accessToken, userId, jwt } = await runOAuth(provider);
     console.log("\nResolving API key...");
-    const resolver = new KeyResolver();
+    const fetchImpl = createProxiedFetch(resolveCliOutboundProxy());
+    const resolver = new KeyResolver(fetchImpl);
     cred = await resolver.resolveCodingPlanCredential(
       accessToken,
       provider,
@@ -265,8 +273,9 @@ async function authStatus(): Promise<void> {
 async function runOAuth(
   provider: ProviderId,
 ): Promise<{ accessToken: string; userId?: string; jwt?: string }> {
+  const fetchImpl = createProxiedFetch(resolveCliOutboundProxy());
   if (provider === "bigmodel") {
-    const oauth = new BigmodelOAuthClient();
+    const oauth = new BigmodelOAuthClient(fetchImpl);
     const result = await oauth.authorize((url) => {
       console.log("Open this URL to authorize:\n");
       console.log(`  ${url}\n`);
@@ -280,7 +289,7 @@ async function runOAuth(
     };
   }
 
-  const oauth = new ZaiOAuthClient();
+  const oauth = new ZaiOAuthClient(fetchImpl);
   const result = await oauth.authorize((url) => {
     console.log("Open this URL to authorize:\n");
     console.log(`  ${url}\n`);
@@ -330,6 +339,16 @@ function importFromZCodeConfig(provider: ProviderId): Credential {
   console.log(`Imported from ${configPath}`);
   if (jwt) console.log(`  Start-plan JWT: ${jwt.slice(0, 12)}...`);
   return { apiKey, provider, jwt };
+}
+
+/**
+ * Resolve the outbound proxy for CLI commands (`auth login`), which run
+ * before/without a loaded `config.yaml`. Reads the same env var the config
+ * loader honors, so `ZCODE_OUTBOUND_PROXY` works consistently everywhere.
+ */
+function resolveCliOutboundProxy(): { url: string } | undefined {
+  const url = process.env.ZCODE_OUTBOUND_PROXY;
+  return url ? { url } : undefined;
 }
 
 function openBrowser(url: string): void {

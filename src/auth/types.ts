@@ -22,6 +22,15 @@ export interface Credential {
   userId?: string;
   /** JWT token for start-plan (zcode.z.ai). Present when login captured the ZCode plan token. */
   jwt?: string;
+  /**
+   * Sticky outbound proxy URL assigned to this specific account (pool mode
+   * only). When set, the request for this credential is routed through this
+   * proxy instead of the global `outboundProxy`, so each pool account
+   * consistently egresses from the same IP — useful when testing whether a
+   * rejection (e.g. gateway 1005) is actually a per-IP rate limit rather
+   * than genuine per-account quota exhaustion.
+   */
+  proxyUrl?: string;
 }
 
 /**

@@ -12,7 +12,9 @@
 import type { Format } from "../translator/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
+import type { Credential } from "../auth/types.js";
 import { getProvider } from "../provider/providers.js";
+import { createProxiedFetch } from "./outbound-proxy.js";
 import {
   buildUpstreamHeaderPairs,
   buildUpstreamRequest,
@@ -47,6 +49,14 @@ import type {
   AnthropicMessagesRequest,
   AnthropicMessagesResponse,
 } from "../translator/types.js";
+
+/**
+ * Max number of accounts to rotate through on repeated gateway 1005
+ * (quota exhausted / rate-limited) responses for a single client request.
+ * Each hop re-solves a fresh captcha token (a few seconds via Playwright),
+ * so this is kept small to bound worst-case request latency.
+ */
+const POOL_ROTATION_MAX_HOPS = 3;
 
 /** Options for the proxy handler. */
 export interface ProxyHandlerOptions {
@@ -171,7 +181,7 @@ export async function proxyRequest(
   let captchaHeaders: Record<string, string> | undefined;
   if (startPlan) {
     try {
-      const token = await getCaptchaToken(config.identity.appVersion);
+      const token = await getCaptchaToken(config.identity.appVersion, config.outboundProxy);
       captchaHeaders = {
         [RETRY_HEADERS.PARAM]: token.verifyParam,
         [RETRY_HEADERS.REGION]: token.region,
@@ -221,8 +231,8 @@ export async function proxyRequest(
       upstreamHeaderPairs,
       transformedBody,
       translateOpenAIToAnthropic || translateAnthropicToOpenAI || startPlan,
-      useOrderedTransport,
-      fetchImpl,
+      useOrderedTransport && !cred.proxyUrl,
+      effectiveFetchImpl(fetchImpl, cred),
     );
   } catch (err) {
     if (debug)
@@ -279,7 +289,7 @@ export async function proxyRequest(
     console.log(`${reqId} captcha challenge, re-solving...`);
     invalidateCaptchaToken();
     try {
-      const fresh = await getCaptchaToken(config.identity.appVersion);
+      const fresh = await getCaptchaToken(config.identity.appVersion, config.outboundProxy);
       console.log(
         `${reqId} captcha re-solved (token ${fresh.verifyParam.length} chars), retrying...`,
       );
@@ -312,8 +322,8 @@ export async function proxyRequest(
         upstreamHeaderPairs,
         transformedBody,
         translateOpenAIToAnthropic || translateAnthropicToOpenAI || startPlan,
-        useOrderedTransport,
-        fetchImpl,
+        useOrderedTransport && !cred.proxyUrl,
+        effectiveFetchImpl(fetchImpl, cred),
       ).catch((err: Error) => {
         if (debug) debugError(reqId, "upstream_unreachable", err.message);
         printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
@@ -340,12 +350,129 @@ export async function proxyRequest(
     upstreamResp.headers.get("content-type")?.includes("text/event-stream") ??
     false;
 
+  // Pool mode: on gateway 1005 (quota exhausted / rate-limited), rotate to
+  // the next account and retry, up to POOL_ROTATION_MAX_HOPS times — a
+  // single retry isn't always enough since 1005 can hit more than one
+  // account in a row (e.g. transient per-account rate limiting rather than
+  // true exhaustion). Runs BEFORE the generic passthrough JSON-error check
+  // below so pool mode gets first refusal on 1005 responses — otherwise
+  // (for Anthropic-format clients on start-plan, where neither translate
+  // flag is set) the generic check would convert 1005 straight to a 402 and
+  // return before rotation ever runs.
+  if (startPlan && auth.isPool()) {
+    let hop = 0;
+    while (true) {
+      if (upstreamResp.status !== 200) break;
+      const ct2 = upstreamResp.headers.get("content-type") ?? "";
+      if (!ct2.includes("application/json")) break;
+      const bodyText = await upstreamResp.text().catch(() => null);
+      if (bodyText === null) break;
+
+      let code: number | undefined;
+      try {
+        code = (JSON.parse(bodyText) as { code?: number }).code;
+      } catch {
+        code = undefined;
+      }
+
+      if (code !== 1005 || hop >= POOL_ROTATION_MAX_HOPS) {
+        // Not a rotation case (success, unrelated error, unparseable body),
+        // or we've exhausted our retry budget — reconstruct so downstream
+        // code (translation / peekUpstreamJsonError) can still read the
+        // already-consumed body.
+        upstreamResp = new Response(bodyText, {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: upstreamResp.headers,
+        });
+        break;
+      }
+
+      hop++;
+      console.log(
+        `${reqId} pool: quota exhausted for ${meta.model} (hop ${hop}/${POOL_ROTATION_MAX_HOPS}), rotating...`,
+      );
+      auth.markExhausted(cred, meta.model);
+      const nextCred = await auth.getCredential(meta.model).catch(() => null);
+      if (!nextCred) {
+        // No other account available — reconstruct the final 1005 body so
+        // the client/peekUpstreamJsonError sees a proper error.
+        upstreamResp = new Response(bodyText, {
+          status: upstreamResp.status,
+          statusText: upstreamResp.statusText,
+          headers: upstreamResp.headers,
+        });
+        break;
+      }
+      cred = nextCred;
+
+      // Aliyun captcha tokens are single-use — the previous account's
+      // captchaHeaders were already spent. Re-solve a fresh token for each
+      // hop; reusing a stale one causes a 3007 "captcha verify failed" on
+      // the new account.
+      let retryHeaders = captchaHeaders;
+      try {
+        const fresh = await getCaptchaToken(
+          config.identity.appVersion,
+          config.outboundProxy,
+        );
+        retryHeaders = {
+          [RETRY_HEADERS.PARAM]: fresh.verifyParam,
+          [RETRY_HEADERS.REGION]: fresh.region,
+        };
+      } catch {
+        // Fall back to the stale headers — better to attempt the retry
+        // than to give up entirely.
+      }
+
+      upstreamHeaderPairs = buildUpstreamHeaderPairs(
+        clientReq,
+        upstreamFormat,
+        cred,
+        config.identity,
+        config.plan,
+        retryHeaders,
+        clientSession,
+      );
+      upstreamReq = buildUpstreamRequest(
+        clientReq,
+        upstreamFormat,
+        provider,
+        cred,
+        transformedBody,
+        config.identity,
+        config.plan,
+        retryHeaders,
+        clientSession,
+      );
+      upstreamResp = await sendUpstreamRequest(
+        upstreamReq,
+        upstreamHeaderPairs,
+        transformedBody,
+        translateOpenAIToAnthropic || translateAnthropicToOpenAI || startPlan,
+        useOrderedTransport && !cred.proxyUrl,
+        effectiveFetchImpl(fetchImpl, cred),
+      ).catch((err: Error) => {
+        if (debug) debugError(reqId, "upstream_unreachable", err.message);
+        printRow(reqId, format, meta, 502, started, Date.now(), 0, 0, 0);
+        return errorResponse(502, "upstream_unreachable", err.message);
+      });
+      if (debug)
+        debugLine(reqId, `← pool retry (hop ${hop}) ${upstreamResp.status}`);
+      headersAt = Date.now();
+      // Loop continues — the top-of-loop checks handle this new response,
+      // rotating again (up to the hop limit) if it's also a 1005.
+    }
+  }
+
   // In passthrough mode, the upstream can return JSON error responses
   // (1005 quota, 3001 param error, 3012 method not allowed) that the client
   // can't interpret since it expects SSE or Anthropic JSON. Detect and
   // surface as proper errors instead of passing through silently.
   // peekUpstreamJsonError consumes the body — we must reassign upstreamResp
   // if the body was read but is NOT an error.
+  // Runs after the pool-rotation check above, so it acts as a fallback for
+  // non-pool modes and for pool mode once rotation exhausts all accounts.
   if (
     !translateOpenAIToAnthropic &&
     !translateAnthropicToOpenAI &&
@@ -375,87 +502,6 @@ export async function proxyRequest(
         statusText: upstreamResp.statusText,
         headers: upstreamResp.headers,
       });
-    }
-  }
-
-  // Pool mode: on gateway 1005 (quota exhausted), rotate to next account
-  if (startPlan && auth.isPool() && upstreamResp.status === 200) {
-    const ct2 = upstreamResp.headers.get("content-type") ?? "";
-    if (ct2.includes("application/json")) {
-      const bodyText = await upstreamResp.text().catch(() => null);
-      if (bodyText) {
-        try {
-          const parsed = JSON.parse(bodyText) as { code?: number };
-          if (parsed.code === 1005) {
-            console.log(
-              `${reqId} pool: quota exhausted for ${meta.model}, rotating...`,
-            );
-            auth.markExhausted(cred, meta.model);
-            const nextCred = await auth
-              .getCredential(meta.model)
-              .catch(() => null);
-            if (nextCred) {
-              cred = nextCred;
-              upstreamHeaderPairs = buildUpstreamHeaderPairs(
-                clientReq,
-                upstreamFormat,
-                cred,
-                config.identity,
-                config.plan,
-                captchaHeaders,
-                clientSession,
-              );
-              upstreamReq = buildUpstreamRequest(
-                clientReq,
-                upstreamFormat,
-                provider,
-                cred,
-                transformedBody,
-                config.identity,
-                config.plan,
-                captchaHeaders,
-                clientSession,
-              );
-              upstreamResp = await sendUpstreamRequest(
-                upstreamReq,
-                upstreamHeaderPairs,
-                transformedBody,
-                translateOpenAIToAnthropic ||
-                  translateAnthropicToOpenAI ||
-                  startPlan,
-                useOrderedTransport,
-                fetchImpl,
-              ).catch((err: Error) => {
-                if (debug)
-                  debugError(reqId, "upstream_unreachable", err.message);
-                printRow(
-                  reqId,
-                  format,
-                  meta,
-                  502,
-                  started,
-                  Date.now(),
-                  0,
-                  0,
-                  0,
-                );
-                return errorResponse(502, "upstream_unreachable", err.message);
-              });
-              if (debug)
-                debugLine(reqId, `← pool retry ${upstreamResp.status}`);
-              headersAt = Date.now();
-            }
-          }
-        } catch {
-          /* ignore — pass through */
-        }
-        // Reconstruct so downstream code can still read the body
-        upstreamResp = new Response(bodyText, {
-          status: upstreamResp.status,
-          statusText: upstreamResp.statusText,
-          headers: upstreamResp.headers,
-        });
-      }
     }
   }
 
@@ -572,6 +618,10 @@ export function shouldUseOrderedTransport(
   hasCustomFetchImpl: boolean,
 ): boolean {
   if (hasCustomFetchImpl) return false;
+  // The ordered transport connects via raw TCP/TLS sockets and cannot honor
+  // an outbound HTTP/SOCKS proxy. Fall back to fetchImpl (which does) when one
+  // is configured, trading the exact-header-ordering optimization for correctness.
+  if (config.outboundProxy) return false;
   return (
     clientSession?.action === "enforce" || clientSession?.source === "explicit"
   );
@@ -595,6 +645,21 @@ async function sendUpstreamRequest(
     });
   }
   return fetchImpl(upstreamReq, translateMode ? {} : { decompress: false });
+}
+
+/**
+ * Wrap `fetchImpl` with the credential's sticky per-account proxy (pool mode
+ * with `pool.accountProxies` configured), if it has one. Falls back to
+ * `fetchImpl` unchanged otherwise (which already honors the global
+ * `outboundProxy`, if any).
+ */
+function effectiveFetchImpl(
+  fetchImpl: typeof fetch,
+  cred: Credential,
+): typeof fetch {
+  return cred.proxyUrl
+    ? createProxiedFetch({ url: cred.proxyUrl }, fetchImpl)
+    : fetchImpl;
 }
 
 /**

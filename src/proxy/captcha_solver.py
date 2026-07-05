@@ -45,12 +45,33 @@ async def solve(
     region: str,
     sdk_path: str,
     timeout_ms: int = SOLVE_TIMEOUT_MS,
+    proxy: str | None = None,
 ) -> str:
-    """Launch Chromium, inject the Aliyun SDK, solve, return verifyParam."""
+    """Launch Chromium, inject the Aliyun SDK, solve, return verifyParam.
+
+    `proxy`, when set, is a proxy URL (http://, https://, or socks5://) that
+    Chromium routes all traffic through — matches the outbound proxy the
+    TypeScript proxy uses for its own upstream requests.
+    """
     sdk_source = Path(sdk_path).read_text(encoding="utf-8")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            proxy={"server": proxy} if proxy else None,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--disable-web-security",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
+                "--enable-webgl",
+                "--ignore-gpu-blocklist",
+                "--use-gl=swiftshader",
+            ],
+        )
         try:
             context = await browser.new_context(
                 user_agent=USER_AGENT,
@@ -59,6 +80,20 @@ async def solve(
                 viewport={"width": 1280, "height": 720},
             )
             page = await context.new_page()
+
+            # Anti-detection: remove navigator.webdriver and spoof WebGL
+            await page.add_init_script(
+                """() => {
+                    delete Object.getPrototypeOf(navigator).webdriver;
+                    // Spoof WebGL vendor to look like a real GPU
+                    const getParameter = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function(p) {
+                        if (p === 37445) return 'Intel Inc.';
+                        if (p === 37446) return 'Intel Iris OpenGL Engine';
+                        return getParameter.call(this, p);
+                    };
+                }"""
+            )
 
             # Set up the page shell, then inject the SDK via add_script_tag
             # (avoids </script> parsing issues that break inline injection)
@@ -109,9 +144,34 @@ async def solve(
                                     catch (e) { clearTimeout(timeout); reject(e); }
                                 }
                             },
-                            success: (param) => { clearTimeout(timeout); resolve(param); },
-                            fail: (err) => { clearTimeout(timeout); reject(err); },
-                            onError: (err) => { clearTimeout(timeout); reject(err); },
+                            success: (param) => {
+                                clearTimeout(timeout);
+                                // SDK may pass an object or the verifyParam directly.
+                                // Extract the string token — page.evaluate needs a serializable return.
+                                if (typeof param === 'string') {
+                                    resolve(param);
+                                } else if (param && param.verifyParam) {
+                                    resolve(param.verifyParam);
+                                } else if (param && typeof param.captchaVerifyParam === 'string') {
+                                    resolve(param.captchaVerifyParam);
+                                } else if (param && typeof param.toString === 'function') {
+                                    const s = param.toString();
+                                    if (s !== '[object Object]') resolve(s);
+                                    else resolve(JSON.stringify(param));
+                                } else {
+                                    resolve(JSON.stringify(param));
+                                }
+                            },
+                            fail: (err) => {
+                                clearTimeout(timeout);
+                                reject(typeof err === 'string' ? new Error(err) :
+                                       err && err.message ? err : new Error(JSON.stringify(err)));
+                            },
+                            onError: (err) => {
+                                clearTimeout(timeout);
+                                reject(typeof err === 'string' ? new Error(err) :
+                                       err && err.message ? err : new Error(JSON.stringify(err)));
+                            },
                         });
                     });
                 }""",
@@ -138,6 +198,7 @@ async def main() -> None:
             region=config["region"],
             sdk_path=config["sdkPath"],
             timeout_ms=int(config.get("timeout", SOLVE_TIMEOUT_MS)),
+            proxy=config.get("proxy") or None,
         )
         print(json.dumps({"success": True, "verifyParam": token}))
     except Exception as e:

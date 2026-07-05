@@ -26,6 +26,7 @@ beforeEach(() => {
   delete process.env.ZCODE_APP_VERSION;
   delete process.env.ZCODE_SOURCE_TITLE;
   delete process.env.ZCODE_REFERER_ORIGIN;
+  delete process.env.ZCODE_OUTBOUND_PROXY;
 });
 
 afterEach(() => {
@@ -246,5 +247,70 @@ identity:
 `);
     const cfg = loadConfig(path);
     expect(cfg.identity.appVersion).toBe("3.2.4");
+  });
+
+  it("outboundProxy: absent by default", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.outboundProxy).toBeUndefined();
+  });
+
+  it("outboundProxy: reads url from YAML", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+outboundProxy:
+  url: "socks5://127.0.0.1:1080"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.outboundProxy).toEqual({ url: "socks5://127.0.0.1:1080" });
+  });
+
+  it("outboundProxy: ZCODE_OUTBOUND_PROXY env overrides YAML", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+outboundProxy:
+  url: "socks5://from-yaml:1080"
+`);
+    process.env.ZCODE_OUTBOUND_PROXY = "http://from-env:8080";
+    const cfg = loadConfig(path);
+    expect(cfg.outboundProxy).toEqual({ url: "http://from-env:8080" });
+  });
+
+  it("outboundProxy: throws on an invalid scheme", () => {
+    const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+outboundProxy:
+  url: "ftp://127.0.0.1:21"
+`);
+    expect(() => loadConfig(path)).toThrow(/outboundProxy\.url must be/);
+  });
+
+  it("outboundProxy: accepts http, https, socks4, socks5, and socks5h schemes", () => {
+    for (const url of [
+      "http://127.0.0.1:8080",
+      "https://127.0.0.1:8443",
+      "socks4://127.0.0.1:1080",
+      "socks5://127.0.0.1:1080",
+      "socks5h://127.0.0.1:1080",
+    ]) {
+      const path = writeYaml(`
+auth:
+  mode: apikey
+  apiKey: "abc"
+outboundProxy:
+  url: "${url}"
+`);
+      expect(loadConfig(path).outboundProxy).toEqual({ url });
+    }
   });
 });
