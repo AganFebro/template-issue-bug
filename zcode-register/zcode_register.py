@@ -126,6 +126,20 @@ def start_callback_server(result: dict):
     return server, port
 
 
+def _url_host_path(url: str) -> str:
+    """Return 'hostname + path' only (no query string).
+
+    Query strings can carry values like `app_domain=chat.z.ai` or a
+    `continue=` param embedding another URL — a naive substring check on the
+    full URL (e.g. `"chat.z.ai" in page.url`) can false-positive on those
+    values while still genuinely on a different page (e.g.
+    accounts.google.com with `chat.z.ai` only appearing as a query value).
+    Use this for all "which page are we on" checks instead.
+    """
+    p = urlparse(url)
+    return f"{p.hostname or ''}{p.path or ''}"
+
+
 def build_authorize_url(callback_port: int) -> str:
     """Build the chat.z.ai authorize URL with localhost callback."""
     redirect_uri = f"http://127.0.0.1:{callback_port}/oauth/callback/zai"
@@ -362,6 +376,28 @@ def save_credential(cred: dict) -> None:
 # ──────────────────────────────────────────────────────────────
 # PLAYWRIGHT AUTO-LOGIN
 # ──────────────────────────────────────────────────────────────
+async def _handle_zai_consent_checkbox(page) -> bool:
+    """Tick the checkbox + click Continue on chat.z.ai's consent page
+    (https://chat.z.ai/auth/oauth/authorize). Returns True if handled.
+
+    Extracted so both Step 6 (first arrival) and Step 7 (a repeat arrival,
+    e.g. after Google detours through a TOS/challenge page) can reuse it.
+    """
+    try:
+        print(f"  ├─ On z.ai consent page, ticking checkbox...")
+        cb = page.locator('input[type="checkbox"]').first
+        await cb.wait_for(state="attached", timeout=8000)
+        await cb.click(force=True, timeout=5000)
+        await asyncio.sleep(1)
+        await page.locator('button:has-text("Continue")').last.click(timeout=5000)
+        print(f"  ├─ Continue clicked")
+        await asyncio.sleep(3)
+        return True
+    except Exception as e:
+        print(f"  ├─ z.ai consent checkbox failed: {e}")
+        return False
+
+
 async def _handle_google_challenge(page, password: str) -> None:
     """Handle Google security challenge page (signin/challenge/pwd).
 
@@ -501,7 +537,7 @@ async def register_zcode(email: str, password: str) -> dict | None:
             for _ in range(8):
                 await asyncio.sleep(2)
                 try:
-                    cur_url = page.url
+                    cur_url = _url_host_path(page.url)
 
                     # Already past Google — let Step 6 handle chat.z.ai consent
                     if "chat.z.ai" in cur_url or "127.0.0.1" in cur_url:
@@ -543,14 +579,13 @@ async def register_zcode(email: str, password: str) -> dict | None:
                             continue
 
                     # Workspace terms of service
-                    if "workspacetermsofservice" in cur_url or "speedbump" in cur_url:
+                    if "workspacetermsofservice" in cur_url:
                         print(f"  ├─ Handling TOS agreement...")
                         await page.evaluate(
                             "window.scrollTo(0, document.body.scrollHeight)"
                         )
                         await page.locator(
-                            'button:has-text("I Understand"), button:has-text("I understand"), '
-                            'button:has-text("Understand"), input[type="submit"]'
+                            "text=I understand"
                         ).first.click(timeout=5000)
                         continue
 
@@ -609,16 +644,7 @@ async def register_zcode(email: str, password: str) -> dict | None:
                 for _ in range(10):
                     await asyncio.sleep(2)
                     if "chat.z.ai/auth/oauth/authorize" in page.url:
-                        print(f"  ├─ On z.ai consent page, ticking checkbox...")
-                        cb = page.locator('input[type="checkbox"]').first
-                        await cb.wait_for(state="attached", timeout=8000)
-                        await cb.click(force=True, timeout=5000)
-                        await asyncio.sleep(1)
-                        await page.locator('button:has-text("Continue")').last.click(
-                            timeout=5000
-                        )
-                        print(f"  ├─ Continue clicked")
-                        await asyncio.sleep(3)
+                        await _handle_zai_consent_checkbox(page)
                         break
                     if result["received"]:
                         break
@@ -626,8 +652,10 @@ async def register_zcode(email: str, password: str) -> dict | None:
                 pass
 
             # Step 7: Handle post-consent Google pages that may appear with
-            # unpredictable timing: workspace ToS, signin/oauth/id confirmation.
-            # Each needs user interaction before the redirect fires.
+            # unpredictable timing: workspace ToS, signin/oauth/id confirmation,
+            # or a repeat visit to the chat.z.ai consent checkbox (can happen if
+            # Google detours through a TOS/challenge page after Step 6 already
+            # finished polling).
             print(f"  ├─ Waiting for Google post-consent pages...")
 
             for _ in range(15):
@@ -641,12 +669,19 @@ async def register_zcode(email: str, password: str) -> dict | None:
                 except:
                     pass
 
-                cur_url = page.url
+                cur_url = _url_host_path(page.url)
 
-                # Redirected back to chat.z.ai or callback — we're done here
-                if "chat.z.ai" in cur_url or "127.0.0.1" in cur_url:
+                # Reached the real OAuth callback target — we're done here
+                if "127.0.0.1" in cur_url:
                     print(f"  ├─ Step 7: redirected to {cur_url[:80]}")
                     break
+
+                # Repeat (or first, if Step 6 missed it) visit to chat.z.ai's
+                # consent checkbox page — tick + Continue, then keep polling
+                # for the actual redirect to the 127.0.0.1 callback.
+                if "chat.z.ai/auth/oauth/authorize" in cur_url:
+                    await _handle_zai_consent_checkbox(page)
+                    continue
 
                 # Workspace TOS agreement page
                 if "workspacetermsofservice" in cur_url:
@@ -656,10 +691,12 @@ async def register_zcode(email: str, password: str) -> dict | None:
                             "window.scrollTo(0, document.body.scrollHeight)"
                         )
                         await asyncio.sleep(1)
-                        btn = page.locator(
-                            'button:has-text("I Understand"), button:has-text("I understand")'
-                        ).first
-                        await btn.click(timeout=5000)
+                        # Google's "I understand" is a Material span, not a
+                        # <button>. Unquoted text= is case-insensitive substring
+                        # match — the real text is lowercase "I understand".
+                        await page.locator(
+                            "text=I understand"
+                        ).first.click(timeout=5000)
                         print(f"  ├─ TOS I Understand clicked")
                         await asyncio.sleep(3)
                     except Exception as e:
