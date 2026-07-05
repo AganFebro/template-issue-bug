@@ -222,8 +222,14 @@ Start-plan uses Aliyun intelligent captcha verification. The proxy spawns a Pyth
 
 **Prerequisites:**
 
-- Python 3 with `cloakbrowser` package installed (`pip install cloakbrowser`)
+- Python 3 with `cloakbrowser` package installed — install the `geoip` extra too (`pip install "cloakbrowser[geoip]"`) so the solver can auto-match timezone/locale to a proxy's exit IP; without it, geoip is silently skipped (still works, just without that extra signal)
 - Chromium system dependencies installed (`playwright install-deps chromium`) — CloakBrowser downloads its own stealth Chromium binary (~200MB, cached locally on first run), but still needs the same OS-level libraries as regular Chromium
+- On Linux (VPS/Docker), install font packages — CloakBrowser spoofs a Windows fingerprint on Linux by default, and a minimal Linux install has none of the fonts a real Windows browser would report, which is itself a font/canvas-fingerprint mismatch signal:
+  ```bash
+  sudo apt install -y fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
+    fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
+  ```
+  (The solver already sets `CLOAKBROWSER_SUPPRESS_FONT_WARNING=1` so this is just a non-fatal advisory, not a hard requirement — but installing these is recommended if captcha rejections persist.)
 
 The solver (`src/proxy/captcha_solver.py`) is launched automatically per-request. Solve time is ~8-12 seconds. Captcha tokens are single-use — every request gets a fresh solve.
 

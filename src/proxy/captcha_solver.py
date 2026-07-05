@@ -33,6 +33,17 @@ from pathlib import Path
 
 from cloakbrowser import launch_async
 
+# geoip auto-detection (timezone/locale from the proxy's exit IP) needs the
+# optional `cloakbrowser[geoip]` extra (geoip2 package). Degrade gracefully
+# when it's not installed instead of failing every solve attempt — the
+# fingerprint/proxy IP still helps even without matched timezone/locale.
+try:
+    import geoip2  # noqa: F401
+
+    _HAS_GEOIP = True
+except ImportError:
+    _HAS_GEOIP = False
+
 SOLVE_TIMEOUT_MS = 40_000
 SDK_LOAD_TIMEOUT_MS = 20_000
 
@@ -57,10 +68,11 @@ async def solve(
     browser = await launch_async(
         headless=True,
         proxy=proxy,
-        # Auto-match timezone/locale to the proxy's exit IP when one is set —
-        # avoids a UTC/en-US-on-a-residential-IP mismatch signal. No proxy →
-        # no geoip call, CloakBrowser's own defaults apply.
-        geoip=bool(proxy),
+        # Auto-match timezone/locale to the proxy's exit IP when one is set
+        # and the optional geoip2 dependency is installed — avoids a
+        # UTC/en-US-on-a-residential-IP mismatch signal. No proxy, or no
+        # geoip2 installed → no geoip call, CloakBrowser's own defaults apply.
+        geoip=bool(proxy) and _HAS_GEOIP,
         args=[
             "--no-sandbox",
             "--disable-setuid-sandbox",

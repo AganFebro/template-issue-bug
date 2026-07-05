@@ -194,6 +194,13 @@ async function solveWithPlaywright(
     stdin: new Blob([input]),
     stdout: "pipe",
     stderr: "pipe",
+    env: {
+      ...process.env,
+      // Silence CloakBrowser's non-fatal "no Windows fonts" advisory — it's
+      // printed to stderr on every launch and would otherwise mask the real
+      // error below (stderr is preferred over stdout when both are present).
+      CLOAKBROWSER_SUPPRESS_FONT_WARNING: "1",
+    },
   });
 
   const [stdout, stderr, exitCode] = await Promise.all([
@@ -203,9 +210,17 @@ async function solveWithPlaywright(
   ]);
 
   if (exitCode !== 0) {
-    const detail = stderr.trim() || stdout.trim() || `(exit ${exitCode})`;
+    // Prefer stdout (our own structured `{"success":false,"error":...}` goes
+    // there) but include stderr too — a stray warning on stderr should never
+    // silently hide the real failure reason from stdout.
+    const stdoutTrim = stdout.trim();
+    const stderrTrim = stderr.trim();
+    const detail =
+      stdoutTrim && stderrTrim
+        ? `${stdoutTrim} | stderr: ${stderrTrim}`
+        : stdoutTrim || stderrTrim || `(exit ${exitCode})`;
     throw new Error(
-      `python solver exited ${exitCode}: ${detail.slice(0, 300)}`,
+      `python solver exited ${exitCode}: ${detail.slice(0, 500)}`,
     );
   }
 
