@@ -28,8 +28,10 @@ see the `proxy` param and pool.accountProxies in the main config.
 
 import asyncio
 import json
+import socket
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from cloakbrowser import launch_async
 
@@ -46,6 +48,25 @@ except ImportError:
 
 SOLVE_TIMEOUT_MS = 40_000
 SDK_LOAD_TIMEOUT_MS = 20_000
+PROXY_CHECK_TIMEOUT_S = 5.0
+
+
+def _check_proxy_reachable(proxy_url: str, timeout: float = PROXY_CHECK_TIMEOUT_S) -> None:
+    """Fast TCP reachability check for the proxy host:port before launching
+    the browser. A dead/unreachable proxy otherwise surfaces as a vague
+    ~30s Playwright navigation timeout inside set_content() with no hint of
+    which proxy is actually broken — this fails fast (a few seconds) with a
+    clear, identifying error instead.
+    """
+    parsed = urlparse(proxy_url)
+    host, port = parsed.hostname, parsed.port
+    if not host or not port:
+        return  # unparseable — let the browser launch surface any real error
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
+    except OSError as e:
+        raise RuntimeError(f"proxy unreachable ({host}:{port}): {e}") from e
 
 
 async def solve(
@@ -64,6 +85,8 @@ async def solve(
     upstream requests, so the captcha-solve IP and the API-request IP match.
     """
     sdk_source = Path(sdk_path).read_text(encoding="utf-8")
+    if proxy:
+        _check_proxy_reachable(proxy)
 
     browser = await launch_async(
         headless=True,
@@ -94,12 +117,17 @@ async def solve(
 
         # Set up the page shell, then inject the SDK via add_script_tag
         # (avoids </script> parsing issues that break inline injection)
+        # wait_until="domcontentloaded" — our shell has zero external
+        # resources, so there's nothing for the default "load" wait to gain;
+        # it only makes us vulnerable to unrelated stalls (e.g. proxy/network
+        # layer hiccups) blocking on a full "load" event we don't need.
         await page.set_content(
             """<!DOCTYPE html>
             <html><head></head><body>
               <div id="captcha-element"></div>
               <button id="captcha-button"></button>
-            </body></html>"""
+            </body></html>""",
+            wait_until="domcontentloaded",
         )
         await page.add_script_tag(content=sdk_source)
 
