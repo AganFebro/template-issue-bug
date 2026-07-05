@@ -31,24 +31,10 @@ import json
 import os
 import socket
 import sys
-import time
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 from cloakbrowser import launch_async
-
-_T0 = time.monotonic()
-
-
-def _log_ts(label: str) -> None:
-    """Timestamped stderr breadcrumb (elapsed seconds since process start).
-
-    Diagnostic-only: pinpoints whether a slow/stuck solve is spent in
-    CloakBrowser's launch (binary start, geoip DB download/lookup — CPU and
-    network bound, ~70 MB on first use) vs. the actual page/captcha steps.
-    Cheap and always-on since it only writes a few short lines to stderr.
-    """
-    print(f"[timing] +{time.monotonic() - _T0:.2f}s {label}", file=sys.stderr, flush=True)
 
 # geoip auto-detection (timezone/locale from the proxy's exit IP) needs the
 # optional `cloakbrowser[geoip]` extra (geoip2 package). Degrade gracefully
@@ -100,10 +86,8 @@ async def solve(
     upstream requests, so the captcha-solve IP and the API-request IP match.
     """
     sdk_source = Path(sdk_path).read_text(encoding="utf-8")
-    _log_ts("sdk read")
     if proxy:
         _check_proxy_reachable(proxy)
-        _log_ts("proxy reachable")
 
     # Kill-switch for the geoip lookup (timezone/locale auto-match from the
     # proxy's exit IP): it downloads a ~70 MB GeoLite2 DB on first use and
@@ -129,7 +113,6 @@ async def solve(
             "--disable-site-isolation-trials",
         ],
     )
-    _log_ts("browser launched")
     try:
         # No manual user-agent/locale/timezone override, no navigator.webdriver
         # deletion, no WebGL JS patching — CloakBrowser's C++-level patches
@@ -139,7 +122,6 @@ async def solve(
         # plain-Playwright approach detectable.
         context = await browser.new_context(viewport={"width": 1280, "height": 720})
         page = await context.new_page()
-        _log_ts("context+page ready")
 
         # Set up the page shell, then inject the SDK via add_script_tag
         # (avoids </script> parsing issues that break inline injection).
@@ -159,16 +141,13 @@ async def solve(
               <button id="captcha-button"></button>
             </body></html>"""
         await page.goto("data:text/html;charset=utf-8," + quote(html), wait_until="domcontentloaded")
-        _log_ts("goto done")
         await page.add_script_tag(content=sdk_source)
-        _log_ts("sdk script tag injected")
 
         # Wait for the SDK to expose initAliyunCaptcha
         await page.wait_for_function(
             "typeof window.initAliyunCaptcha === 'function'",
             timeout=SDK_LOAD_TIMEOUT_MS,
         )
-        _log_ts("sdk ready")
 
         # Set the AliyunCaptchaConfig (SDK reads this on init)
         await page.evaluate(

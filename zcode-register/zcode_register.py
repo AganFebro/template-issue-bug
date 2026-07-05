@@ -400,9 +400,10 @@ async def _handle_google_challenge(page, password: str) -> None:
 
 async def register_zcode(email: str, password: str) -> dict | None:
     """Register/log into zcode via Google OAuth. Returns credential dict or None."""
-    result = {"code": None, "error": None, "received": False}
+    result: dict = {"code": None, "error": None, "received": False, "state": None}
     server, port = start_callback_server(result)
     authorize_url, state, redirect_uri = build_authorize_url(port)
+    result["state"] = state
     print(f"  Callback : http://127.0.0.1:{port}/...")
     print(f"  State    : {state[:16]}...")
 
@@ -502,6 +503,10 @@ async def register_zcode(email: str, password: str) -> dict | None:
                 try:
                     cur_url = page.url
 
+                    # Already past Google — let Step 6 handle chat.z.ai consent
+                    if "chat.z.ai" in cur_url or "127.0.0.1" in cur_url:
+                        break
+
                     # Google security challenge (signin/challenge)
                     if "challenge" in cur_url:
                         print(
@@ -539,17 +544,23 @@ async def register_zcode(email: str, password: str) -> dict | None:
 
                     # Workspace terms of service
                     if "workspacetermsofservice" in cur_url or "speedbump" in cur_url:
-                        print(f"  ├─ Accepting terms of service...")
+                        print(f"  ├─ Handling TOS agreement...")
                         await page.evaluate(
                             "window.scrollTo(0, document.body.scrollHeight)"
                         )
                         await page.locator(
-                            'button:has-text("I understand"), button:has-text("Understand"), input[type="submit"]'
+                            'button:has-text("I Understand"), button:has-text("I understand"), '
+                            'button:has-text("Understand"), input[type="submit"]'
                         ).first.click(timeout=5000)
                         continue
 
+                    # Only check Google consent buttons when on a Google domain.
+                    # Without this guard, the disabled "Continue" button on
+                    # chat.z.ai's consent page matches and burns iterations.
+                    if "google" not in cur_url and "accounts." not in cur_url:
+                        continue
+
                     # Google consent / Allow / Lanjutkan button
-                    # Covers: Continue, Allow, Agree, Lanjutkan (id), 继续并分享 (zh)
                     consent = page.locator(
                         'button:has-text("Continue"), button:has-text("Allow"), '
                         'button:has-text("Agree"), button:has-text("Lanjutkan"), '
@@ -587,10 +598,6 @@ async def register_zcode(email: str, password: str) -> dict | None:
                         await recovery.first.click()
                         continue
 
-                    # Already past Google — check if we're on z.ai
-                    if "chat.z.ai" in cur_url or "127.0.0.1" in cur_url:
-                        break
-
                     break
                 except:
                     break
@@ -618,29 +625,78 @@ async def register_zcode(email: str, password: str) -> dict | None:
             except:
                 pass
 
-            # Step 7: Handle signin/oauth/id — Google's "You're signed in as..." page
-            # Shows the email and a Continue button. If not clicked, the OAuth
-            # flow stalls here. The consent loop may miss it if timing is off.
-            if "signin/oauth/id" in page.url:
-                print(f"  ├─ On Google signin confirmation, clicking Continue...")
+            # Step 7: Handle post-consent Google pages that may appear with
+            # unpredictable timing: workspace ToS, signin/oauth/id confirmation.
+            # Each needs user interaction before the redirect fires.
+            print(f"  ├─ Waiting for Google post-consent pages...")
+
+            for _ in range(15):
+                await asyncio.sleep(3)
+                if result["received"]:
+                    break
+
+                # Wait for any in-flight navigation to commit
                 try:
-                    # Try all common button selectors
-                    btn = page.locator(
-                        'button:has-text("Continue"), div[role="button"]:has-text("Continue"), '
-                        'button:has-text("Lanjutkan"), div[role="button"]:has-text("Lanjutkan"), '
-                        'button[type="submit"]'
-                    ).first
-                    if await btn.is_visible(timeout=5000):
-                        await btn.click(timeout=5000)
-                        await asyncio.sleep(5)
-                        print(f"  ├─ Continue clicked, waiting for redirect...")
-                    else:
-                        # Fallback: press Enter on the page
-                        await page.keyboard.press("Enter")
-                        await asyncio.sleep(5)
+                    await page.wait_for_load_state("domcontentloaded", timeout=2000)
                 except:
-                    await page.keyboard.press("Enter")
-                    await asyncio.sleep(5)
+                    pass
+
+                cur_url = page.url
+
+                # Redirected back to chat.z.ai or callback — we're done here
+                if "chat.z.ai" in cur_url or "127.0.0.1" in cur_url:
+                    print(f"  ├─ Step 7: redirected to {cur_url[:80]}")
+                    break
+
+                # Workspace TOS agreement page
+                if "workspacetermsofservice" in cur_url:
+                    print(f"  ├─ Handling TOS agreement...")
+                    try:
+                        await page.evaluate(
+                            "window.scrollTo(0, document.body.scrollHeight)"
+                        )
+                        await asyncio.sleep(1)
+                        btn = page.locator(
+                            'button:has-text("I Understand"), button:has-text("I understand")'
+                        ).first
+                        await btn.click(timeout=5000)
+                        print(f"  ├─ TOS I Understand clicked")
+                        await asyncio.sleep(3)
+                    except Exception as e:
+                        print(f"  ├─ TOS click failed: {e}")
+                    continue
+
+                # Google security challenge
+                if "challenge" in cur_url:
+                    print(f"  ├─ Google security challenge, re-entering password...")
+                    await _handle_google_challenge(page, password)
+                    continue
+
+                # signin/oauth/id — "You're signed in as..." confirmation
+                if "signin/oauth/id" in cur_url:
+                    print(f"  ├─ On Google signin confirmation, clicking Continue...")
+                    try:
+                        btn = page.locator(
+                            'button:has-text("Continue"), div[role="button"]:has-text("Continue"), '
+                            'button:has-text("Lanjutkan"), div[role="button"]:has-text("Lanjutkan"), '
+                            'button[type="submit"]'
+                        ).first
+                        if await btn.is_visible(timeout=5000):
+                            await btn.click(timeout=5000)
+                            await asyncio.sleep(3)
+                            print(f"  ├─ Continue clicked, waiting for redirect...")
+                            continue
+                        else:
+                            await page.keyboard.press("Enter")
+                            await asyncio.sleep(3)
+                    except:
+                        await page.keyboard.press("Enter")
+                        await asyncio.sleep(3)
+                    continue
+
+                # Debug: show current URL when nothing matched
+                print(f"  ├─ Step 7: waiting... ({cur_url[:100]})")
+                continue
 
             # Step 8: Wait for callback to receive auth code
             print(f"  ├─ Waiting for OAuth callback...")
@@ -657,7 +713,7 @@ async def register_zcode(email: str, password: str) -> dict | None:
 
                     qs = parse_qs(urlparse(page.url).query)
                     code = (qs.get("authCode") or qs.get("code") or [""])[0]
-                    if code and code not in (result["state"] or ""):
+                    if code and code not in (result.get("state") or ""):
                         result["code"] = code
                         result["received"] = True
                     else:
