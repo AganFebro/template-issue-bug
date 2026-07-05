@@ -218,14 +218,16 @@ plan: start-plan
 
 ### Captcha Solver Requirement
 
-Start-plan uses Aliyun intelligent captcha verification. The proxy spawns a Python + Playwright subprocess to solve it — headless Chromium runs the AliyunCaptcha SDK in a real browser to produce a valid device fingerprint.
+Start-plan uses Aliyun intelligent captcha verification. The proxy spawns a Python + [CloakBrowser](https://github.com/CloakHQ/CloakBrowser) subprocess to solve it — a stealth Chromium build (fingerprint patches applied at the C++ source level, not JS injection) runs the AliyunCaptcha SDK to produce a valid device fingerprint.
 
 **Prerequisites:**
 
-- Python 3 with `playwright` package installed (`pip install playwright`)
-- Chromium browsers installed (`playwright install chromium`)
+- Python 3 with `cloakbrowser` package installed (`pip install cloakbrowser`)
+- Chromium system dependencies installed (`playwright install-deps chromium`) — CloakBrowser downloads its own stealth Chromium binary (~200MB, cached locally on first run), but still needs the same OS-level libraries as regular Chromium
 
 The solver (`src/proxy/captcha_solver.py`) is launched automatically per-request. Solve time is ~8-12 seconds. Captcha tokens are single-use — every request gets a fresh solve.
+
+**On IP reputation**: Aliyun's risk engine scores the request server-side — a good fingerprint alone isn't always enough. If you see `verifyCode: F001` (traceless verification failed) or repeated `{"code":3007,"msg":"captcha verify failed"}` despite a clean solve, it's very likely the origin IP (e.g. a VPS/datacenter IP) being flagged, not the browser fingerprint. Configure `pool.accountProxies` or `outboundProxy` with residential-style proxies — the solver automatically routes through the same proxy the matching account/request uses (see [Sticky Per-Account Proxy](#sticky-per-account-proxy-pool-mode)).
 
 ### Available Models
 
@@ -311,7 +313,7 @@ curl http://localhost:8080/v1/models \
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
 | config file path | `ZCODE_PROXY_CONFIG` | `config.yaml` | Config file to load on `serve` |
 
-Start-plan captcha tunables (env only): `ZCODE_CAPTCHA_RETRIES`, `ZCODE_CAPTCHA_TIMEOUT_MS`, `ZCODE_CAPTCHA_SDK_LOAD_MS`.
+Start-plan captcha tunables (env only): `ZCODE_CAPTCHA_RETRIES` (solve attempts before giving up, default `3`), `ZCODE_CAPTCHA_TIMEOUT_MS` (per-attempt solve timeout, default `40000`), `ZCODE_CAPTCHA_PYTHON` (override the auto-detected `python3`/`python` binary).
 
 ## Architecture
 
@@ -351,7 +353,7 @@ Auth + Identity Header Injection
       │
       ▼
 Captcha (start-plan only)
-  Pre-solve: getCaptchaToken() → spawns captcha_solver.py (Playwright headless Chromium)
+  Pre-solve: getCaptchaToken() → spawns captcha_solver.py (CloakBrowser stealth Chromium)
              → injects bundled AliyunCaptcha SDK → solves intelligent captcha
              → returns verifyParam token → injected as x-aliyun-captcha-verify-param header
   On 403:   detectCaptchaChallenge (header-based) OR detectCaptchaRejection (3007 body)

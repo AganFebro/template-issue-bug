@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aliyun captcha solver using Playwright (headless Chromium).
+"""Aliyun captcha solver using CloakBrowser (stealth Chromium).
 
 Reads JSON config from stdin:
   { "sceneId": "...", "prefix": "...", "region": "...", "sdkPath": "..." }
@@ -12,12 +12,18 @@ The SDK source is read from `sdkPath` (bundled AliyunCaptcha.js.txt) and
 injected via page.add_script_tag() — no CDN dependency, matching the
 no-CDN property of the previous jsdom solver.
 
-Why Playwright over jsdom: Aliyun's FeiLin device-fingerprint SDK detects
-the jsdom environment (via Bun.version, process, Buffer globals that leak
-through Function("return this")()), producing a fingerprint that Aliyun
-rejects with verifyCode F001. A real Chromium engine produces a real
-fingerprint that passes. This mirrors what the ZCode desktop client does
-(it uses Electron/Chromium internally).
+Why CloakBrowser over plain Playwright: Aliyun's FeiLin device-fingerprint
+SDK scores the browser server-side (`verifyCode: F001` = risk engine
+rejection, not a JS-detectable failure). Plain Playwright's fingerprint
+looks synthetic even with manual `navigator.webdriver` deletion / WebGL
+spoofing via `page.add_init_script()` — those are JS-level patches, easy
+for risk engines to fingerprint themselves (inconsistent with other signals).
+CloakBrowser patches Chromium at the C++ source level (canvas, WebGL, audio,
+fonts, GPU, screen, automation signals) so the binary itself reports as a
+normal browser — no JS injection needed, and `geoip=True` auto-matches
+timezone/locale to the proxy's exit IP, avoiding a UTC+en-US-on-a-residential-
+IP mismatch. IP reputation (datacenter vs. residential) still matters most —
+see the `proxy` param and pool.accountProxies in the main config.
 """
 
 import asyncio
@@ -25,15 +31,7 @@ import json
 import sys
 from pathlib import Path
 
-from playwright.async_api import TimeoutError as PlaywrightTimeout
-from playwright.async_api import async_playwright
-
-# Mirrors FAKE_UA in captcha.ts — must look like a real Windows Chrome UA
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
+from cloakbrowser import launch_async
 
 SOLVE_TIMEOUT_MS = 40_000
 SDK_LOAD_TIMEOUT_MS = 20_000
@@ -47,145 +45,132 @@ async def solve(
     timeout_ms: int = SOLVE_TIMEOUT_MS,
     proxy: str | None = None,
 ) -> str:
-    """Launch Chromium, inject the Aliyun SDK, solve, return verifyParam.
+    """Launch stealth Chromium, inject the Aliyun SDK, solve, return verifyParam.
 
     `proxy`, when set, is a proxy URL (http://, https://, or socks5://) that
-    Chromium routes all traffic through — matches the outbound proxy the
-    TypeScript proxy uses for its own upstream requests.
+    Chromium routes all traffic through — matches the outbound proxy (or the
+    pool account's sticky proxy) the TypeScript proxy uses for its own
+    upstream requests, so the captcha-solve IP and the API-request IP match.
     """
     sdk_source = Path(sdk_path).read_text(encoding="utf-8")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            proxy={"server": proxy} if proxy else None,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-site-isolation-trials",
-                "--enable-webgl",
-                "--ignore-gpu-blocklist",
-                "--use-gl=swiftshader",
-            ],
+    browser = await launch_async(
+        headless=True,
+        proxy=proxy,
+        # Auto-match timezone/locale to the proxy's exit IP when one is set —
+        # avoids a UTC/en-US-on-a-residential-IP mismatch signal. No proxy →
+        # no geoip call, CloakBrowser's own defaults apply.
+        geoip=bool(proxy),
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-web-security",
+            "--disable-features=IsolateOrigins,site-per-process",
+            "--disable-site-isolation-trials",
+        ],
+    )
+    try:
+        # No manual user-agent/locale/timezone override, no navigator.webdriver
+        # deletion, no WebGL JS patching — CloakBrowser's C++-level patches
+        # already produce a consistent, real-looking fingerprint. Overriding
+        # pieces manually here would just reintroduce the inconsistencies
+        # (mismatched UA vs. Client Hints, double-patched WebGL) that made the
+        # plain-Playwright approach detectable.
+        context = await browser.new_context(viewport={"width": 1280, "height": 720})
+        page = await context.new_page()
+
+        # Set up the page shell, then inject the SDK via add_script_tag
+        # (avoids </script> parsing issues that break inline injection)
+        await page.set_content(
+            """<!DOCTYPE html>
+            <html><head></head><body>
+              <div id="captcha-element"></div>
+              <button id="captcha-button"></button>
+            </body></html>"""
         )
-        try:
-            context = await browser.new_context(
-                user_agent=USER_AGENT,
-                locale="en-US",
-                timezone_id="America/Los_Angeles",
-                viewport={"width": 1280, "height": 720},
-            )
-            page = await context.new_page()
+        await page.add_script_tag(content=sdk_source)
 
-            # Anti-detection: remove navigator.webdriver and spoof WebGL
-            await page.add_init_script(
-                """() => {
-                    delete Object.getPrototypeOf(navigator).webdriver;
-                    // Spoof WebGL vendor to look like a real GPU
-                    const getParameter = WebGLRenderingContext.prototype.getParameter;
-                    WebGLRenderingContext.prototype.getParameter = function(p) {
-                        if (p === 37445) return 'Intel Inc.';
-                        if (p === 37446) return 'Intel Iris OpenGL Engine';
-                        return getParameter.call(this, p);
-                    };
-                }"""
-            )
+        # Wait for the SDK to expose initAliyunCaptcha
+        await page.wait_for_function(
+            "typeof window.initAliyunCaptcha === 'function'",
+            timeout=SDK_LOAD_TIMEOUT_MS,
+        )
 
-            # Set up the page shell, then inject the SDK via add_script_tag
-            # (avoids </script> parsing issues that break inline injection)
-            await page.set_content(
-                """<!DOCTYPE html>
-                <html><head></head><body>
-                  <div id="captcha-element"></div>
-                  <button id="captcha-button"></button>
-                </body></html>"""
-            )
-            await page.add_script_tag(content=sdk_source)
+        # Set the AliyunCaptchaConfig (SDK reads this on init)
+        await page.evaluate(
+            f"""window.AliyunCaptchaConfig = {{ region: {json.dumps(region)}, prefix: {json.dumps(prefix)} }};"""
+        )
 
-            # Wait for the SDK to expose initAliyunCaptcha
-            await page.wait_for_function(
-                "typeof window.initAliyunCaptcha === 'function'",
-                timeout=SDK_LOAD_TIMEOUT_MS,
-            )
-
-            # Set the AliyunCaptchaConfig (SDK reads this on init)
-            await page.evaluate(
-                f"""window.AliyunCaptchaConfig = {{ region: {json.dumps(region)}, prefix: {json.dumps(prefix)} }};"""
-            )
-
-            # Call initAliyunCaptcha and wait for success/fail/onError
-            # The promise resolves with the verifyParam string on success
-            # and rejects with an error object on failure.
-            token = await page.evaluate(
-                """async (cfg) => {
-                    return await new Promise((resolve, reject) => {
-                        const timeout = setTimeout(
-                            () => reject(new Error("captcha solve timeout after " + cfg.timeout + "ms")),
-                            cfg.timeout
-                        );
-                        window.initAliyunCaptcha({
-                            SceneId: cfg.sceneId,
-                            mode: "popup",
-                            region: cfg.region,
-                            prefix: cfg.prefix,
-                            language: "en",
-                            element: "#captcha-element",
-                            button: "#captcha-button",
-                            captchaLogoImg: "",
-                            showErrorTip: false,
-                            getInstance: (inst) => {
-                                const fn = inst.startTracelessVerification || inst.show;
-                                if (typeof fn === "function") {
-                                    try { fn.call(inst); }
-                                    catch (e) { clearTimeout(timeout); reject(e); }
-                                }
-                            },
-                            success: (param) => {
-                                clearTimeout(timeout);
-                                // SDK may pass an object or the verifyParam directly.
-                                // Extract the string token — page.evaluate needs a serializable return.
-                                if (typeof param === 'string') {
-                                    resolve(param);
-                                } else if (param && param.verifyParam) {
-                                    resolve(param.verifyParam);
-                                } else if (param && typeof param.captchaVerifyParam === 'string') {
-                                    resolve(param.captchaVerifyParam);
-                                } else if (param && typeof param.toString === 'function') {
-                                    const s = param.toString();
-                                    if (s !== '[object Object]') resolve(s);
-                                    else resolve(JSON.stringify(param));
-                                } else {
-                                    resolve(JSON.stringify(param));
-                                }
-                            },
-                            fail: (err) => {
-                                clearTimeout(timeout);
-                                reject(typeof err === 'string' ? new Error(err) :
-                                       err && err.message ? err : new Error(JSON.stringify(err)));
-                            },
-                            onError: (err) => {
-                                clearTimeout(timeout);
-                                reject(typeof err === 'string' ? new Error(err) :
-                                       err && err.message ? err : new Error(JSON.stringify(err)));
-                            },
-                        });
+        # Call initAliyunCaptcha and wait for success/fail/onError
+        # The promise resolves with the verifyParam string on success
+        # and rejects with an error object on failure.
+        token = await page.evaluate(
+            """async (cfg) => {
+                return await new Promise((resolve, reject) => {
+                    const timeout = setTimeout(
+                        () => reject(new Error("captcha solve timeout after " + cfg.timeout + "ms")),
+                        cfg.timeout
+                    );
+                    window.initAliyunCaptcha({
+                        SceneId: cfg.sceneId,
+                        mode: "popup",
+                        region: cfg.region,
+                        prefix: cfg.prefix,
+                        language: "en",
+                        element: "#captcha-element",
+                        button: "#captcha-button",
+                        captchaLogoImg: "",
+                        showErrorTip: false,
+                        getInstance: (inst) => {
+                            const fn = inst.startTracelessVerification || inst.show;
+                            if (typeof fn === "function") {
+                                try { fn.call(inst); }
+                                catch (e) { clearTimeout(timeout); reject(e); }
+                            }
+                        },
+                        success: (param) => {
+                            clearTimeout(timeout);
+                            // SDK may pass an object or the verifyParam directly.
+                            // Extract the string token — page.evaluate needs a serializable return.
+                            if (typeof param === 'string') {
+                                resolve(param);
+                            } else if (param && param.verifyParam) {
+                                resolve(param.verifyParam);
+                            } else if (param && typeof param.captchaVerifyParam === 'string') {
+                                resolve(param.captchaVerifyParam);
+                            } else if (param && typeof param.toString === 'function') {
+                                const s = param.toString();
+                                if (s !== '[object Object]') resolve(s);
+                                else resolve(JSON.stringify(param));
+                            } else {
+                                resolve(JSON.stringify(param));
+                            }
+                        },
+                        fail: (err) => {
+                            clearTimeout(timeout);
+                            reject(typeof err === 'string' ? new Error(err) :
+                                   err && err.message ? err : new Error(JSON.stringify(err)));
+                        },
+                        onError: (err) => {
+                            clearTimeout(timeout);
+                            reject(typeof err === 'string' ? new Error(err) :
+                                   err && err.message ? err : new Error(JSON.stringify(err)));
+                        },
                     });
-                }""",
-                {
-                    "sceneId": scene_id,
-                    "prefix": prefix,
-                    "region": region,
-                    "timeout": timeout_ms,
-                },
-            )
+                });
+            }""",
+            {
+                "sceneId": scene_id,
+                "prefix": prefix,
+                "region": region,
+                "timeout": timeout_ms,
+            },
+        )
 
-            return token
-        finally:
-            await browser.close()
+        return token
+    finally:
+        await browser.close()
 
 
 async def main() -> None:
