@@ -2,8 +2,6 @@
 
 A reverse proxy for Z.AI / Bigmodel.cn coding-plan APIs that exposes both OpenAI-compatible and Anthropic-format endpoints.
 
-## No http/socks proxy support yet! Still a very experimental codes, proceed with caution.
-
 ## Quick Start
 
 ```bash
@@ -80,8 +78,11 @@ python zcode_register.py
 
 # Check aggregate pool balance
 python check_balance.py
-python check_balance.py --detail   # per-account
-python check_balance.py --failed   # show stale JWTs
+python check_balance.py --detail            # per-account
+python check_balance.py --failed            # show stale JWTs
+python check_balance.py --exhausted         # accounts with zero quota on any model
+python check_balance.py --exhausted all     # accounts with zero quota on EVERY model
+python check_balance.py --exhausted glm-5-turbo  # accounts exhausted on this model only
 ```
 
 Then in `config.yaml`:
@@ -192,7 +193,7 @@ The main proxy server has its own separate `outboundProxy` setting (see
 [Outbound Proxy](#outbound-proxy) below) for routing upstream LLM requests
 through a proxy.
 
-
+## Start-Plan (zcode.z.ai Gateway)
 
 The `start-plan` tier routes through zcode.z.ai with JWT auth + captcha verification. It requires OAuth login mode.
 
@@ -303,6 +304,8 @@ curl http://localhost:8080/v1/models \
 | `providers.<p>.credential` | — | — | Per-provider credential override (else uses `auth.apiKey`) |
 | `pool.poolPath` | — | `pool.json` | Path to pool credentials JSON (pool mode only) |
 | `pool.refreshIntervalMs` | — | `300000` | Quota refresh interval in ms (pool mode only) |
+| `pool.accountProxies` | — | — | Sticky per-account outbound proxy list, round-robin by account index (pool mode only) |
+| `outboundProxy.url` | `ZCODE_OUTBOUND_PROXY` | — | Global HTTP/HTTPS/SOCKS5 proxy for all outbound requests (also applies to `auth login`) |
 | `identity.appVersion` | `ZCODE_APP_VERSION` | `3.2.4` | `User-Agent: ZCode/{version}` |
 | `identity.sourceTitle` | `ZCODE_SOURCE_TITLE` | `cli` | `X-Title: Z Code@{title}` |
 | `identity.refererOrigin` | `ZCODE_REFERER_ORIGIN` | `https://zcode.z.ai` | `HTTP-Referer` URL |
@@ -366,10 +369,15 @@ Response Handling
   Passthrough SSE:          tee'd — stats branch → observeStream; client branch → forwarded
   Translation batch:        Anthropic JSON ↔ OpenAI JSON → re-gzip if client accepts
   Translation SSE stream:   Anthropic SSE ↔ OpenAI SSE chunks → client
-  Gateway error detection:  peekUpstreamJsonError converts 1005/3001/3012 JSON errors
-                            (returned with 200 status) to proper HTTP 402/400/405
   Pool rotation (start-plan): on 1005 quota exhaustion, mark account exhausted →
-                            rotate to next best account → silently retry
+                            re-solve a fresh captcha token → rotate to next best
+                            account → retry, up to POOL_ROTATION_MAX_HOPS times
+                            (runs before generic error detection so it isn't
+                            shadowed by the 1005→402 mapping below)
+  Gateway error detection:  peekUpstreamJsonError converts remaining 1005/3001/3012
+                            JSON errors (returned with 200 status) to proper
+                            HTTP 402/400/405 — fallback for non-pool modes or once
+                            rotation exhausts its hop budget
   Pool quota refresh:      background timer calls billing/balance per account every
                             `refreshIntervalMs` to keep quota data current
 ```

@@ -19,3 +19,4 @@ fix-fn.ts
 debug*.png
 pool.json
 test_encrypted.json
+zcode-register/config.json

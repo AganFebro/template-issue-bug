@@ -5,13 +5,17 @@ Reads pool.json (plain JSON, same format as zcode_register.py output),
 calls billing/balance for each account, and displays totals.
 
 Usage:
-  python check_balance.py           # aggregate all accounts
-  python check_balance.py --detail  # show per-account breakdown too
+  python check_balance.py                     # aggregate all accounts
+  python check_balance.py --detail            # show per-account breakdown too
+  python check_balance.py --exhausted          # accounts with zero quota on any model
+  python check_balance.py --exhausted all      # accounts with zero quota on EVERY model
+  python check_balance.py --exhausted glm-5-turbo  # accounts exhausted on this model only
 """
 
 import json
 import os
 import platform
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -86,6 +90,25 @@ def fmt(n: int) -> str:
     return str(n)
 
 
+def canon(name: str) -> str:
+    """Canonicalize a model name for loose matching: lowercase, strip everything
+    but letters/digits. Mirrors src/auth/pool.ts's canonicalizeModelName so
+    `--exhausted glm-5-turbo` matches the billing API's "GLM-5-Turbo".
+    """
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def flag_value(flag: str) -> str | None:
+    """Return the value following `flag` in sys.argv, or None if omitted
+    (e.g. bare `--exhausted`, or immediately followed by another `--flag`)."""
+    if flag not in sys.argv:
+        return None
+    i = sys.argv.index(flag)
+    if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
+        return sys.argv[i + 1]
+    return None
+
+
 def bar(pct: float, width: int = 20) -> str:
     """Draw a colored progress bar."""
     filled = int(width * pct)
@@ -112,6 +135,8 @@ def main():
 
     show_detail = "--detail" in sys.argv
     show_failed = "--failed" in sys.argv or show_detail
+    show_exhausted = "--exhausted" in sys.argv
+    exhausted_filter = flag_value("--exhausted")  # None (any) | "all" | "<model>"
 
     print()
     print(f"  \033[36m╔{'═' * 42}╗\033[0m")
@@ -124,7 +149,7 @@ def main():
     # Fetch all balances in parallel
     print(f"  Fetching quotas for {len(pool)} accounts...")
     t0 = time.time()
-    results: list[dict] = []
+    results: list[tuple[dict, dict]] = []
     errors = 0
     failed_accounts: list[dict] = []
     idx = 0
@@ -137,7 +162,7 @@ def main():
             try:
                 bal = future.result()
                 if bal:
-                    results.append(bal)
+                    results.append((acc, bal))
                     if show_detail:
                         remaining = sum(v["remaining"] for v in bal.values())
                         print(f"    \033[2m#{idx}: {fmt(remaining)} available\033[0m")
@@ -159,10 +184,16 @@ def main():
         still_failed = []
         for acc in failed_accounts:
             bal = fetch_balance(acc, retries=5)
+            email = acc.get("email", "?")
             if bal:
-                results.append(bal)
+                results.append((acc, bal))
+                if show_detail:
+                    remaining = sum(v["remaining"] for v in bal.values())
+                    print(f"    \033[32m✓ {email}: {fmt(remaining)} available\033[0m")
             else:
                 still_failed.append(acc)
+                if show_detail:
+                    print(f"    \033[31m✗ {email}: still failing\033[0m")
         recovered = len(failed_accounts) - len(still_failed)
         failed_accounts = still_failed
         if show_detail and recovered > 0:
@@ -178,7 +209,7 @@ def main():
 
     # Aggregate
     agg: dict[str, dict] = {}
-    for bal in results:
+    for _, bal in results:
         for model, q in bal.items():
             if model not in agg:
                 agg[model] = {"remaining": 0, "total": 0}
@@ -220,6 +251,37 @@ def main():
         )
 
     print(f"\n  \033[90mFetched in {elapsed:.1f}s\033[0m")
+
+    if show_exhausted:
+        mode = (exhausted_filter or "any").lower()
+        exhausted: list[tuple[str, list[str]]] = []
+        for acc, bal in results:
+            zeroed = sorted(
+                model for model, q in bal.items() if q["remaining"] <= 0
+            )
+            if mode == "all":
+                if bal and len(zeroed) == len(bal):
+                    exhausted.append((acc.get("email", "?"), zeroed))
+            elif mode == "any":
+                if zeroed:
+                    exhausted.append((acc.get("email", "?"), zeroed))
+            else:
+                target = canon(mode)
+                matched = [m for m in zeroed if canon(m) == target]
+                if matched:
+                    exhausted.append((acc.get("email", "?"), matched))
+
+        label = {
+            "all": "have zero quota on ALL models",
+            "any": "have zero quota on at least one model",
+        }.get(mode, f"have zero quota on {exhausted_filter}")
+
+        if exhausted:
+            print(f"\n  \033[33m{len(exhausted)} account(s) {label}:\033[0m")
+            for email, zeroed_models in exhausted:
+                print(f"    \033[2m{email}\033[0m: {', '.join(zeroed_models)}")
+        else:
+            print(f"\n  \033[32mNo accounts {label}.\033[0m")
 
     if show_failed and failed_accounts:
         print(
